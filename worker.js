@@ -54,12 +54,60 @@ async function hasWebGPU() {
 }
 
 // 주의: 인코더를 fp16으로 돌리면 결과가 깨진다(테스트로 확인). 항상 fp32 사용.
-const DTYPES = {
-  webgpu: { encoder_model: 'fp32', decoder_model_merged: 'q4' },
-  wasm: { encoder_model: 'q8', decoder_model_merged: 'q8' },
-};
+function dtypeFor(modelId, device) {
+  if (device === 'wasm') return { encoder_model: 'q8', decoder_model_merged: 'q8' };
+  return SMALL_GPU_DTYPE && modelId.endsWith('small')
+    ? SMALL_GPU_DTYPE
+    : { encoder_model: 'fp32', decoder_model_merged: 'q4' };
+}
+// small은 fp32 인코더면 약 590MB라 폰에서 메모리 부족으로 실패한다. 4비트(약 300MB)도 정확도는 거의 같다.
+const SMALL_GPU_DTYPE = { encoder_model: 'q4', decoder_model_merged: 'q4' };
 
-async function load(modelId) {
+// 16비트 PCM WAV를 Float32로 읽기 (워커에는 AudioContext가 없다)
+async function loadSelfTestAudio() {
+  const buf = await (await fetch('selftest.wav')).arrayBuffer();
+  const v = new DataView(buf);
+  let p = 12;
+  while (p < v.byteLength - 8) {
+    const id = String.fromCharCode(v.getUint8(p), v.getUint8(p + 1), v.getUint8(p + 2), v.getUint8(p + 3));
+    const size = v.getUint32(p + 4, true);
+    if (id === 'data') {
+      const n = size / 2, out = new Float32Array(n);
+      for (let i = 0; i < n; i++) out[i] = v.getInt16(p + 8 + i * 2, true) / 32768;
+      return out;
+    }
+    p += 8 + size + (size & 1);
+  }
+  throw new Error('selftest.wav 읽기 실패');
+}
+
+async function loadModel(modelId, device, progress_callback) {
+  model = await WhisperForConditionalGeneration.from_pretrained(modelId, {
+    dtype: dtypeFor(modelId, device),
+    device,
+    progress_callback,
+  });
+  const gc = model.generation_config;
+  tok = {
+    sot: gc.decoder_start_token_id,
+    ko: gc.lang_to_id['<|ko|>'],
+    en: gc.lang_to_id['<|en|>'],
+    transcribe: gc.task_to_id['transcribe'],
+    noTs: gc.no_timestamps_token_id,
+  };
+}
+
+// 샘플 음성("Hello, this is a quick test.")을 전사해서 결과가 맞는지 확인. 워밍업도 겸한다.
+async function selfTest() {
+  try {
+    const r = await transcribe(await loadSelfTestAudio(), 'auto');
+    return { ok: r.lang === 'en' && /test/i.test(r.text), text: r.text };
+  } catch (err) {
+    return { ok: false, text: String(err?.message || err) };
+  }
+}
+
+async function load(modelId, preferred) {
   const progress_callback = (p) => {
     if (p.status === 'progress') {
       self.postMessage({ type: 'progress', file: p.file, loaded: p.loaded, total: p.total });
@@ -71,27 +119,28 @@ async function load(modelId) {
     AutoProcessor.from_pretrained(modelId, { progress_callback }),
   ]);
 
-  let device = (await hasWebGPU()) ? 'webgpu' : 'wasm';
-  try {
-    model = await WhisperForConditionalGeneration.from_pretrained(modelId, { dtype: DTYPES[device], device, progress_callback });
-  } catch (err) {
-    if (device !== 'webgpu') throw err;
-    device = 'wasm'; // GPU가 안 되면 CPU로
-    model = await WhisperForConditionalGeneration.from_pretrained(modelId, { dtype: DTYPES[device], device, progress_callback });
+  let device = preferred !== 'wasm' && (await hasWebGPU()) ? 'webgpu' : 'wasm';
+  let test = { ok: false, text: '' };
+  if (device === 'webgpu') {
+    try {
+      await loadModel(modelId, device, progress_callback);
+      self.postMessage({ type: 'status', text: 'GPU 결과 확인 중…' });
+      test = await selfTest();
+    } catch (err) {
+      test = { ok: false, text: String(err?.message || err) };
+    }
+    // 기기에 따라 GPU 결과가 깨지는 경우가 있어서, 틀리면 CPU로 바꾼다
+    if (!test.ok) {
+      try { await model?.dispose(); } catch {}
+      device = 'wasm';
+      self.postMessage({ type: 'status', text: 'GPU 결과가 이상해서 CPU 모드로 바꾸는 중…' });
+    }
   }
-
-  const gc = model.generation_config;
-  tok = {
-    sot: gc.decoder_start_token_id,
-    ko: gc.lang_to_id['<|ko|>'],
-    en: gc.lang_to_id['<|en|>'],
-    transcribe: gc.task_to_id['transcribe'],
-    noTs: gc.no_timestamps_token_id,
-  };
-
-  // 워밍업 (WebGPU 셰이더 컴파일)
-  await transcribe(new Float32Array(16000), 'auto');
-  self.postMessage({ type: 'ready', device });
+  if (device === 'wasm') {
+    await loadModel(modelId, device, progress_callback);
+    test = await selfTest();
+  }
+  self.postMessage({ type: 'ready', device, selftest: test });
 }
 
 async function transcribe(audio, langMode) {
@@ -120,7 +169,7 @@ self.onmessage = (e) => {
   const msg = e.data;
   if (msg.type === 'load') {
     chain = chain.then(() =>
-      load(msg.model).catch((err) => self.postMessage({ type: 'error', message: String(err?.message || err) }))
+      load(msg.model, msg.device).catch((err) => self.postMessage({ type: 'error', message: String(err?.message || err) }))
     );
   } else if (msg.type === 'transcribe') {
     chain = chain.then(async () => {

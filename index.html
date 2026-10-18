@@ -27,8 +27,9 @@
     display: flex; flex-direction: column;
     padding: env(safe-area-inset-top) 0 env(safe-area-inset-bottom);
   }
-  header { padding: 14px 16px 8px; display: flex; align-items: center; gap: 10px; }
-  header h1 { font-size: 18px; margin: 0; flex: 1; }
+  header { padding: 14px 16px 8px; display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+  header h1 { font-size: 18px; margin: 0; flex: 1 0 100%; }
+  header select { flex: 1; min-width: 0; }
   select, button { font: inherit; color: inherit; }
   select {
     background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 6px 8px; font-size: 14px;
@@ -85,7 +86,11 @@
   <select id="model" aria-label="모델">
     <option value="onnx-community/whisper-tiny">빠름 (tiny)</option>
     <option value="onnx-community/whisper-base" selected>보통 (base)</option>
-    <option value="onnx-community/whisper-small">정확 (small)</option>
+    <option value="onnx-community/whisper-small">정확 (small · 느림)</option>
+  </select>
+  <select id="device" aria-label="처리 방식">
+    <option value="auto">GPU</option>
+    <option value="wasm">CPU</option>
   </select>
 </header>
 <div id="status">모델 준비 중…</div>
@@ -136,16 +141,21 @@ function startWorker() {
       barEl.style.display = 'block';
       barFill.style.width = (t ? (l / t) * 100 : 0) + '%';
       statusEl.textContent = `모델 다운로드 중… ${(l / 1e6).toFixed(0)} / ${(t / 1e6).toFixed(0)} MB (처음 한 번만)`;
+    } else if (m.type === 'status') {
+      barEl.style.display = 'none';
+      statusEl.textContent = m.text;
     } else if (m.type === 'ready') {
       ready = true; recBtn.disabled = false; barEl.style.display = 'none';
-      statusEl.textContent = `준비 완료 · ${m.device === 'webgpu' ? 'GPU 가속' : 'CPU'} 사용`;
+      statusEl.textContent = m.selftest?.ok
+        ? `준비 완료 · ${m.device === 'webgpu' ? 'GPU 가속' : 'CPU'} 사용`
+        : `준비됐지만 자체 점검 결과가 이상해요 (${m.device}): "${m.selftest?.text || ''}"`;
     } else if (m.type === 'result') {
       onResult(m);
     } else if (m.type === 'error') {
       statusEl.textContent = '모델 로드 실패: ' + m.message;
     }
   };
-  worker.postMessage({ type: 'load', model: $('#model').value });
+  worker.postMessage({ type: 'load', model: $('#model').value, device: $('#device').value });
 }
 
 const fmt = (s) => {
@@ -226,7 +236,7 @@ class Segmenter {
     this.chunks = []; this.len = 0;
     this.offset = 0;        // 현재 구간 시작 시각(초)
     this.silentFrames = 0; this.speechFrames = 0;
-    this.noise = 0.003;
+    this.noise = 0.002;
   }
   push(samples) {
     const b = new Float32Array(this.buf.length + samples.length);
@@ -238,7 +248,7 @@ class Segmenter {
   addFrame(f) {
     let s = 0; for (let i = 0; i < f.length; i++) s += f[i] * f[i];
     const rms = Math.sqrt(s / f.length);
-    const speech = rms > Math.max(0.008, this.noise * 3);
+    const speech = rms > Math.max(0.004, this.noise * 2.5);
     if (!speech) this.noise = this.noise * 0.95 + rms * 0.05;
     this.level?.(rms);
 
@@ -271,23 +281,57 @@ class Segmenter {
 
 // ---------- 녹음 ----------
 let recording = false, stream, ctx, node, mediaRecorder, recChunks = [], audioBlob = null;
-let segmenter, timerInt, t0, wakeLock;
+let segmenter, timerInt, t0, wakeLock, audioFrames = 0, watchdog;
 
+// 128샘플마다 메시지를 보내면 폰에서 부담이 커서 2048샘플씩 모아 보낸다
 const workletSrc = `
 class Tap extends AudioWorkletProcessor {
-  process(inputs) { const ch = inputs[0][0]; if (ch) this.port.postMessage(ch.slice()); return true; }
+  constructor() { super(); this.buf = new Float32Array(2048); this.n = 0; }
+  process(inputs) {
+    const ch = inputs[0][0];
+    if (ch) {
+      for (let i = 0; i < ch.length; i++) {
+        this.buf[this.n++] = ch[i];
+        if (this.n === this.buf.length) { this.port.postMessage(this.buf.slice()); this.n = 0; }
+      }
+    }
+    return true;
+  }
 }
 registerProcessor('tap', Tap);`;
 
+// 기기 기본 샘플레이트(보통 48kHz)를 16kHz로 줄인다. 구간 평균이라 간단한 저역 필터 역할도 한다.
+function makeResampler(from, to) {
+  const ratio = from / to;
+  let acc = 0, cnt = 0, pos = 0; // pos: 다음 출력 샘플 경계까지 남은 입력 샘플 수
+  pos = ratio;
+  return (input) => {
+    const out = new Float32Array(Math.ceil(input.length / ratio) + 1);
+    let o = 0;
+    for (let i = 0; i < input.length; i++) {
+      acc += input[i]; cnt++;
+      if (--pos <= 0) { out[o++] = acc / cnt; acc = 0; cnt = 0; pos += ratio; }
+    }
+    return out.subarray(0, o);
+  };
+}
+
 async function startRec() {
+  // AudioContext는 버튼을 누른 직후에 만들어야 한다. 마이크 권한 창을 거친 뒤에 만들면
+  // 안드로이드 크롬에서 '일시정지' 상태로 시작해서 소리가 전혀 들어오지 않는다.
+  ctx = new AudioContext();
+  const workletUrl = URL.createObjectURL(new Blob([workletSrc], { type: 'application/javascript' }));
+  const workletReady = ctx.audioWorklet.addModule(workletUrl);
   try {
     stream = await navigator.mediaDevices.getUserMedia({
       audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
     });
   } catch (err) {
+    ctx.close();
     statusEl.textContent = '마이크 권한이 필요해요: ' + err.message;
     return;
   }
+  try { await ctx.resume(); } catch {}
   // 1) 원본 녹음 파일 저장용
   recChunks = []; audioBlob = null;
   const mime = ['audio/webm;codecs=opus', 'audio/mp4', 'audio/webm'].find((t) => window.MediaRecorder?.isTypeSupported?.(t));
@@ -300,16 +344,26 @@ async function startRec() {
   mediaRecorder.start(1000);
 
   // 2) 실시간 전사용 16kHz PCM
-  ctx = new AudioContext({ sampleRate: SR });
-  const url = URL.createObjectURL(new Blob([workletSrc], { type: 'application/javascript' }));
-  await ctx.audioWorklet.addModule(url);
+  await workletReady;
   const src = ctx.createMediaStreamSource(stream);
   node = new AudioWorkletNode(ctx, 'tap');
   const base = lines.length ? Math.ceil(lines[lines.length - 1].t + 5) : 0;
   segmenter = new Segmenter((s, t) => sendSegment(s, base + t));
   segmenter.level = (rms) => (meterFill.style.width = Math.min(100, rms * 600) + '%');
-  node.port.onmessage = (e) => segmenter.push(e.data);
-  src.connect(node);
+  const resample = makeResampler(ctx.sampleRate, SR);
+  audioFrames = 0;
+  node.port.onmessage = (e) => { audioFrames++; segmenter.push(resample(e.data)); };
+  // 일부 기기는 출력에 연결된 노드만 처리하므로, 소리 0으로 스피커에 연결해 둔다
+  const mute = ctx.createGain();
+  mute.gain.value = 0;
+  src.connect(node).connect(mute).connect(ctx.destination);
+
+  clearTimeout(watchdog);
+  watchdog = setTimeout(async () => {
+    if (!recording || audioFrames > 0) return;
+    try { await ctx.resume(); } catch {}
+    if (audioFrames === 0) statusEl.textContent = `마이크 소리가 들어오지 않아요 (오디오 상태: ${ctx.state}). 녹음 버튼을 다시 눌러 보세요.`;
+  }, 3000);
 
   try { wakeLock = await navigator.wakeLock?.request('screen'); } catch {}
 
@@ -324,6 +378,7 @@ async function startRec() {
 function stopRec() {
   recording = false;
   clearInterval(timerInt);
+  clearTimeout(watchdog);
   segmenter?.flush();
   node?.disconnect(); ctx?.close();
   mediaRecorder?.state !== 'inactive' && mediaRecorder.stop();
@@ -387,9 +442,11 @@ $('#clear').onclick = () => {
 $('#lang').value = store.get('lang', 'auto');
 $('#model').value = store.get('model', 'onnx-community/whisper-base');
 $('#lang').onchange = () => store.set('lang', $('#lang').value);
-$('#model').onchange = () => {
+$('#device').value = store.get('device', 'auto');
+$('#model').onchange = $('#device').onchange = () => {
   if (recording) stopRec();
   store.set('model', $('#model').value);
+  store.set('device', $('#device').value);
   statusEl.textContent = '모델 바꾸는 중…';
   startWorker();
 };

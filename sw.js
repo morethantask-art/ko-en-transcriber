@@ -1,8 +1,8 @@
 // 오프라인 지원: 앱 파일과 CDN 라이브러리(전사 엔진)를 캐시한다.
 // 모델 파일은 transformers.js가 자체 캐시('transformers-cache')에 저장한다.
-const APP = 'app-v1';
+const APP = 'app-v2';
 const LIB = 'lib-v1';
-const SHELL = ['./', 'index.html', 'worker.js', 'manifest.webmanifest', 'icon-192.png', 'icon-512.png'];
+const SHELL = ['./', 'index.html', 'worker.js', 'manifest.webmanifest', 'icon-192.png', 'icon-512.png', 'selftest.wav'];
 
 self.addEventListener('install', (e) => {
   e.waitUntil(caches.open(APP).then((c) => c.addAll(SHELL)).then(() => self.skipWaiting()));
