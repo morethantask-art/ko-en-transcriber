@@ -1,0 +1,404 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>한영 전사기</title>
+<meta name="theme-color" content="#1f6feb">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon-192.png">
+<link rel="apple-touch-icon" href="icon-192.png">
+<style>
+  :root {
+    --bg: #f6f7f9; --card: #ffffff; --text: #16181d; --muted: #6b7280; --line: #e5e7eb;
+    --accent: #1f6feb; --rec: #e5484d; --ko: #0e9f6e; --en: #7c3aed;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #0f1115; --card: #181b21; --text: #e8eaee; --muted: #9aa1ad; --line: #2a2f38;
+      --accent: #4c8dff; --rec: #ff6369; --ko: #34d399; --en: #a78bfa;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  body {
+    background: var(--bg); color: var(--text);
+    font: 16px/1.55 system-ui, -apple-system, "Noto Sans KR", "Apple SD Gothic Neo", sans-serif;
+    display: flex; flex-direction: column;
+    padding: env(safe-area-inset-top) 0 env(safe-area-inset-bottom);
+  }
+  header { padding: 14px 16px 8px; display: flex; align-items: center; gap: 10px; }
+  header h1 { font-size: 18px; margin: 0; flex: 1; }
+  select, button { font: inherit; color: inherit; }
+  select {
+    background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 6px 8px; font-size: 14px;
+  }
+  #status { padding: 0 16px 8px; font-size: 13px; color: var(--muted); min-height: 1.6em; }
+  #bar { height: 3px; background: var(--line); margin: 0 16px 8px; border-radius: 3px; overflow: hidden; display: none; }
+  #bar > div { height: 100%; width: 0; background: var(--accent); transition: width .2s; }
+  #transcript {
+    flex: 1; overflow-y: auto; margin: 0 16px; padding: 12px 14px;
+    background: var(--card); border: 1px solid var(--line); border-radius: 14px;
+  }
+  #transcript:empty::before {
+    content: "아래 버튼을 눌러 녹음을 시작하세요.\A 말하는 동안 녹음과 전사가 함께 진행되고, 한국어/영어는 문장마다 자동으로 감지돼요.";
+    white-space: pre-wrap; color: var(--muted);
+  }
+  .line { display: flex; gap: 10px; padding: 6px 0; border-bottom: 1px solid var(--line); }
+  .line:last-child { border-bottom: 0; }
+  .meta { flex: none; width: 46px; font-size: 12px; color: var(--muted); padding-top: 3px; }
+  .badge { display: inline-block; font-size: 10px; font-weight: 700; padding: 0 5px; border-radius: 4px; color: #fff; margin-top: 2px; }
+  .badge.ko { background: var(--ko); } .badge.en { background: var(--en); }
+  .text { flex: 1; word-break: keep-all; overflow-wrap: anywhere; }
+  .pending .text { color: var(--muted); font-style: italic; }
+  footer { padding: 12px 16px 16px; display: flex; align-items: center; gap: 10px; }
+  #rec {
+    flex: none; width: 68px; height: 68px; border-radius: 50%; border: 0; background: var(--rec);
+    color: #fff; display: grid; place-items: center; box-shadow: 0 4px 14px rgb(0 0 0 / .18);
+  }
+  #rec:disabled { opacity: .45; }
+  #rec .sq { width: 22px; height: 22px; border-radius: 5px; background: #fff; display: none; }
+  #rec .dot { width: 26px; height: 26px; border-radius: 50%; background: #fff; }
+  #rec.on .sq { display: block; } #rec.on .dot { display: none; }
+  #rec.on { animation: pulse 1.6s infinite; }
+  @keyframes pulse { 50% { box-shadow: 0 0 0 10px rgb(229 72 77 / .18); } }
+  .side { flex: 1; display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+  #timer { font-variant-numeric: tabular-nums; font-size: 20px; font-weight: 600; }
+  #meter { height: 6px; background: var(--line); border-radius: 6px; overflow: hidden; }
+  #meter > div { height: 100%; width: 0; background: var(--ko); transition: width .08s; }
+  .tools { display: flex; gap: 6px; flex-wrap: wrap; }
+  .tools button, .tools label {
+    background: var(--card); border: 1px solid var(--line); border-radius: 9px; padding: 5px 10px; font-size: 13px; cursor: pointer;
+  }
+  .tools button:disabled { opacity: .4; }
+  input[type=file] { display: none; }
+</style>
+</head>
+<body>
+<header>
+  <h1>한영 전사기</h1>
+  <select id="lang" aria-label="언어">
+    <option value="auto">자동 감지</option>
+    <option value="ko">한국어만</option>
+    <option value="en">영어만</option>
+  </select>
+  <select id="model" aria-label="모델">
+    <option value="onnx-community/whisper-tiny">빠름 (tiny)</option>
+    <option value="onnx-community/whisper-base" selected>보통 (base)</option>
+    <option value="onnx-community/whisper-small">정확 (small)</option>
+  </select>
+</header>
+<div id="status">모델 준비 중…</div>
+<div id="bar"><div></div></div>
+<main id="transcript"></main>
+<footer>
+  <button id="rec" disabled aria-label="녹음"><span class="dot"></span><span class="sq"></span></button>
+  <div class="side">
+    <div id="timer">00:00</div>
+    <div id="meter"><div></div></div>
+    <div class="tools">
+      <button id="copy" disabled>복사</button>
+      <button id="saveTxt" disabled>텍스트 저장</button>
+      <button id="saveAudio" disabled>녹음 파일 저장</button>
+      <label id="fileLabel">파일 전사<input id="file" type="file" accept="audio/*,video/*"></label>
+      <button id="clear">지우기</button>
+    </div>
+  </div>
+</footer>
+
+<script>
+const $ = (s) => document.querySelector(s);
+const statusEl = $('#status'), barEl = $('#bar'), barFill = $('#bar > div');
+const transcriptEl = $('#transcript'), recBtn = $('#rec'), timerEl = $('#timer'), meterFill = $('#meter > div');
+const SR = 16000;
+
+const store = {
+  get(k, d) { try { return localStorage.getItem(k) ?? d; } catch { return d; } },
+  set(k, v) { try { localStorage.setItem(k, v); } catch {} },
+};
+
+// ---------- 워커 ----------
+let worker, ready = false, nextId = 1, pendingCount = 0;
+const segEls = new Map();
+const lines = []; // {t, lang, text}
+
+function startWorker() {
+  ready = false; recBtn.disabled = true;
+  worker?.terminate();
+  worker = new Worker('worker.js', { type: 'module' });
+  const files = {};
+  worker.onmessage = (e) => {
+    const m = e.data;
+    if (m.type === 'progress') {
+      files[m.file] = m;
+      let l = 0, t = 0;
+      for (const f of Object.values(files)) { l += f.loaded; t += f.total; }
+      barEl.style.display = 'block';
+      barFill.style.width = (t ? (l / t) * 100 : 0) + '%';
+      statusEl.textContent = `모델 다운로드 중… ${(l / 1e6).toFixed(0)} / ${(t / 1e6).toFixed(0)} MB (처음 한 번만)`;
+    } else if (m.type === 'ready') {
+      ready = true; recBtn.disabled = false; barEl.style.display = 'none';
+      statusEl.textContent = `준비 완료 · ${m.device === 'webgpu' ? 'GPU 가속' : 'CPU'} 사용`;
+    } else if (m.type === 'result') {
+      onResult(m);
+    } else if (m.type === 'error') {
+      statusEl.textContent = '모델 로드 실패: ' + m.message;
+    }
+  };
+  worker.postMessage({ type: 'load', model: $('#model').value });
+}
+
+const fmt = (s) => {
+  s = Math.max(0, Math.floor(s));
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), x = s % 60;
+  return (h ? h + ':' : '') + String(m).padStart(2, '0') + ':' + String(x).padStart(2, '0');
+};
+
+function sendSegment(samples, t) {
+  const id = nextId++;
+  const el = document.createElement('div');
+  el.className = 'line pending';
+  el.innerHTML = `<div class="meta">${fmt(t)}</div><div class="text">전사 중…</div>`;
+  transcriptEl.append(el);
+  segEls.set(id, { el, t });
+  pendingCount++;
+  updateQueue();
+  scrollDown();
+  worker.postMessage({ type: 'transcribe', id, audio: samples, lang: $('#lang').value }, [samples.buffer]);
+}
+
+function onResult(m) {
+  const seg = segEls.get(m.id);
+  segEls.delete(m.id);
+  pendingCount--;
+  updateQueue();
+  if (!seg) return;
+  if (!m.text || isJunk(m.text)) { seg.el.remove(); return; }
+  seg.el.className = 'line';
+  seg.el.innerHTML = `<div class="meta">${fmt(seg.t)}<br><span class="badge ${m.lang}">${m.lang.toUpperCase()}</span></div><div class="text"></div>`;
+  seg.el.querySelector('.text').textContent = m.text;
+  lines.push({ t: seg.t, lang: m.lang, text: m.text });
+  lines.sort((a, b) => a.t - b.t);
+  persist();
+  scrollDown();
+}
+
+// Whisper가 무음에서 흔히 만들어내는 문구 걸러내기
+const JUNK = [/^\(.*\)$/, /^\[.*\]$/, /^♪+$/, /시청해\s*주셔서\s*감사합니다/, /구독과\s*좋아요/, /^thank you\.?$/i, /^thanks for watching/i, /^you$/i, /^\.+$/];
+const isJunk = (t) => JUNK.some((r) => r.test(t.trim()));
+
+function updateQueue() {
+  if (!ready) return;
+  statusEl.textContent = pendingCount > 0 ? `전사 대기 ${pendingCount}개` : (recording ? '녹음 중 · 말하면 바로 전사돼요' : '준비 완료');
+  const has = lines.length > 0;
+  $('#copy').disabled = $('#saveTxt').disabled = !has;
+}
+
+let stick = true;
+transcriptEl.addEventListener('scroll', () => {
+  stick = transcriptEl.scrollHeight - transcriptEl.scrollTop - transcriptEl.clientHeight < 40;
+});
+const scrollDown = () => { if (stick) transcriptEl.scrollTop = transcriptEl.scrollHeight; };
+
+const asText = () => lines.map((l) => `[${fmt(l.t)}] ${l.text}`).join('\n');
+function persist() { store.set('transcript', JSON.stringify(lines)); }
+function restore() {
+  try {
+    const saved = JSON.parse(store.get('transcript', '[]'));
+    for (const l of saved) {
+      lines.push(l);
+      const el = document.createElement('div');
+      el.className = 'line';
+      el.innerHTML = `<div class="meta">${fmt(l.t)}<br><span class="badge ${l.lang}">${l.lang.toUpperCase()}</span></div><div class="text"></div>`;
+      el.querySelector('.text').textContent = l.text;
+      transcriptEl.append(el);
+    }
+  } catch {}
+}
+
+// ---------- 문장 단위로 자르기 (무음 기준) ----------
+// 100ms 프레임 단위로 소리 크기를 보고, 말이 끝난 뒤 잠깐 조용해지면 잘라서 전사로 보낸다.
+class Segmenter {
+  constructor(onSegment) {
+    this.onSegment = onSegment;
+    this.frame = SR / 10;
+    this.buf = new Float32Array(0);
+    this.chunks = []; this.len = 0;
+    this.offset = 0;        // 현재 구간 시작 시각(초)
+    this.silentFrames = 0; this.speechFrames = 0;
+    this.noise = 0.003;
+  }
+  push(samples) {
+    const b = new Float32Array(this.buf.length + samples.length);
+    b.set(this.buf); b.set(samples, this.buf.length);
+    let i = 0;
+    for (; i + this.frame <= b.length; i += this.frame) this.addFrame(b.subarray(i, i + this.frame));
+    this.buf = b.slice(i);
+  }
+  addFrame(f) {
+    let s = 0; for (let i = 0; i < f.length; i++) s += f[i] * f[i];
+    const rms = Math.sqrt(s / f.length);
+    const speech = rms > Math.max(0.008, this.noise * 3);
+    if (!speech) this.noise = this.noise * 0.95 + rms * 0.05;
+    this.level?.(rms);
+
+    this.chunks.push(f.slice()); this.len += f.length;
+    if (speech) { this.speechFrames++; this.silentFrames = 0; } else this.silentFrames++;
+
+    const dur = this.len / SR;
+    // 말 없이 조용한 구간이 길어지면 앞부분을 버리고 시작점을 당긴다
+    if (this.speechFrames === 0 && this.chunks.length > 5) {
+      const drop = this.chunks.shift(); this.len -= drop.length; this.offset += drop.length / SR;
+      return;
+    }
+    if ((this.speechFrames >= 3 && this.silentFrames >= 7 && dur >= 1.5) || dur >= 25) this.cut();
+  }
+  cut() {
+    if (this.len === 0) return;
+    const out = new Float32Array(this.len);
+    let p = 0; for (const c of this.chunks) { out.set(c, p); p += c.length; }
+    const start = this.offset;
+    this.offset += this.len / SR;
+    const hadSpeech = this.speechFrames >= 3;
+    this.chunks = []; this.len = 0; this.speechFrames = 0; this.silentFrames = 0;
+    if (hadSpeech) this.onSegment(out, start);
+  }
+  flush() {
+    if (this.buf.length) { this.chunks.push(this.buf); this.len += this.buf.length; this.buf = new Float32Array(0); }
+    this.cut();
+  }
+}
+
+// ---------- 녹음 ----------
+let recording = false, stream, ctx, node, mediaRecorder, recChunks = [], audioBlob = null;
+let segmenter, timerInt, t0, wakeLock;
+
+const workletSrc = `
+class Tap extends AudioWorkletProcessor {
+  process(inputs) { const ch = inputs[0][0]; if (ch) this.port.postMessage(ch.slice()); return true; }
+}
+registerProcessor('tap', Tap);`;
+
+async function startRec() {
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+    });
+  } catch (err) {
+    statusEl.textContent = '마이크 권한이 필요해요: ' + err.message;
+    return;
+  }
+  // 1) 원본 녹음 파일 저장용
+  recChunks = []; audioBlob = null;
+  const mime = ['audio/webm;codecs=opus', 'audio/mp4', 'audio/webm'].find((t) => window.MediaRecorder?.isTypeSupported?.(t));
+  mediaRecorder = new MediaRecorder(stream, mime ? { mimeType: mime } : undefined);
+  mediaRecorder.ondataavailable = (e) => e.data.size && recChunks.push(e.data);
+  mediaRecorder.onstop = () => {
+    audioBlob = new Blob(recChunks, { type: mediaRecorder.mimeType || 'audio/webm' });
+    $('#saveAudio').disabled = false;
+  };
+  mediaRecorder.start(1000);
+
+  // 2) 실시간 전사용 16kHz PCM
+  ctx = new AudioContext({ sampleRate: SR });
+  const url = URL.createObjectURL(new Blob([workletSrc], { type: 'application/javascript' }));
+  await ctx.audioWorklet.addModule(url);
+  const src = ctx.createMediaStreamSource(stream);
+  node = new AudioWorkletNode(ctx, 'tap');
+  const base = lines.length ? Math.ceil(lines[lines.length - 1].t + 5) : 0;
+  segmenter = new Segmenter((s, t) => sendSegment(s, base + t));
+  segmenter.level = (rms) => (meterFill.style.width = Math.min(100, rms * 600) + '%');
+  node.port.onmessage = (e) => segmenter.push(e.data);
+  src.connect(node);
+
+  try { wakeLock = await navigator.wakeLock?.request('screen'); } catch {}
+
+  recording = true;
+  recBtn.classList.add('on');
+  $('#fileLabel').style.pointerEvents = 'none'; $('#fileLabel').style.opacity = .4;
+  t0 = Date.now();
+  timerInt = setInterval(() => (timerEl.textContent = fmt((Date.now() - t0) / 1000)), 250);
+  updateQueue();
+}
+
+function stopRec() {
+  recording = false;
+  clearInterval(timerInt);
+  segmenter?.flush();
+  node?.disconnect(); ctx?.close();
+  mediaRecorder?.state !== 'inactive' && mediaRecorder.stop();
+  stream?.getTracks().forEach((t) => t.stop());
+  wakeLock?.release?.(); wakeLock = null;
+  recBtn.classList.remove('on');
+  meterFill.style.width = '0';
+  $('#fileLabel').style.pointerEvents = ''; $('#fileLabel').style.opacity = '';
+  updateQueue();
+}
+
+recBtn.onclick = () => (recording ? stopRec() : startRec());
+
+// 화면이 꺼졌다 켜지면 화면 켜짐 유지를 다시 요청
+document.addEventListener('visibilitychange', async () => {
+  if (recording && document.visibilityState === 'visible' && !wakeLock) {
+    try { wakeLock = await navigator.wakeLock?.request('screen'); } catch {}
+  }
+});
+
+// ---------- 파일 전사 ----------
+$('#file').onchange = async (e) => {
+  const file = e.target.files[0];
+  e.target.value = '';
+  if (!file || !ready) return;
+  statusEl.textContent = '파일 읽는 중…';
+  try {
+    const actx = new AudioContext({ sampleRate: SR });
+    const decoded = await actx.decodeAudioData(await file.arrayBuffer());
+    actx.close();
+    const data = decoded.getChannelData(0);
+    const base = lines.length ? Math.ceil(lines[lines.length - 1].t + 5) : 0;
+    const seg = new Segmenter((s, t) => sendSegment(s, base + t));
+    for (let i = 0; i < data.length; i += SR) seg.push(data.slice(i, i + SR));
+    seg.flush();
+  } catch (err) {
+    statusEl.textContent = '이 파일은 읽을 수 없어요: ' + err.message;
+  }
+};
+
+// ---------- 도구 ----------
+function download(blob, name) {
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob); a.download = name;
+  document.body.append(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+}
+const stamp = () => new Date().toISOString().slice(0, 16).replace(/[:T]/g, '-');
+
+$('#copy').onclick = async () => {
+  try { await navigator.clipboard.writeText(asText()); statusEl.textContent = '복사했어요'; }
+  catch { statusEl.textContent = '복사 실패'; }
+};
+$('#saveTxt').onclick = () => download(new Blob([asText()], { type: 'text/plain;charset=utf-8' }), `전사-${stamp()}.txt`);
+$('#saveAudio').onclick = () => audioBlob && download(audioBlob, `녹음-${stamp()}.${audioBlob.type.includes('mp4') ? 'm4a' : 'webm'}`);
+$('#clear').onclick = () => {
+  if (lines.length && !confirm('전사 내용을 모두 지울까요?')) return;
+  lines.length = 0; transcriptEl.innerHTML = ''; persist(); updateQueue();
+};
+
+$('#lang').value = store.get('lang', 'auto');
+$('#model').value = store.get('model', 'onnx-community/whisper-base');
+$('#lang').onchange = () => store.set('lang', $('#lang').value);
+$('#model').onchange = () => {
+  if (recording) stopRec();
+  store.set('model', $('#model').value);
+  statusEl.textContent = '모델 바꾸는 중…';
+  startWorker();
+};
+
+restore();
+updateQueue();
+startWorker();
+
+if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
+</script>
+</body>
+</html>
