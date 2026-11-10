@@ -143,7 +143,9 @@ async function load(modelId, preferred) {
   self.postMessage({ type: 'ready', device, selftest: test });
 }
 
-async function transcribe(audio, langMode) {
+// maxTokens: 실시간 짧은 구간은 200이면 충분하고, 녹음 후 정밀 전사(최대 30초)는 더 길게 쓴다.
+// Whisper 디코더는 최대 448 토큰이라 앞의 특수 토큰을 빼고 440까지.
+async function transcribe(audio, langMode, maxTokens = 200) {
   const inputs = await processor(audio);
   const langIds = langMode === 'ko' ? [tok.ko] : langMode === 'en' ? [tok.en] : [tok.ko, tok.en];
   const logits_processor = new LogitsProcessorList();
@@ -153,7 +155,7 @@ async function transcribe(audio, langMode) {
     ...inputs,
     decoder_input_ids: [tok.sot],
     logits_processor,
-    max_new_tokens: 200,
+    max_new_tokens: Math.min(440, maxTokens),
     no_repeat_ngram_size: 0,
   });
   const seq = out.tolist()[0].map(Number);
@@ -175,7 +177,7 @@ self.onmessage = (e) => {
     chain = chain.then(async () => {
       try {
         const t0 = performance.now();
-        const r = await transcribe(msg.audio, msg.lang);
+        const r = await transcribe(msg.audio, msg.lang, msg.maxTokens);
         self.postMessage({ type: 'result', id: msg.id, ...r, ms: performance.now() - t0 });
       } catch (err) {
         self.postMessage({ type: 'result', id: msg.id, lang: null, text: '', error: String(err?.message || err) });

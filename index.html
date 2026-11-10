@@ -29,7 +29,7 @@
   }
   header { padding: 14px 16px 8px; display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
   header h1 { font-size: 18px; margin: 0; flex: 1 0 100%; }
-  header select { flex: 1; min-width: 0; }
+  header select { flex: 1 1 calc(50% - 4px); min-width: 0; }
   select, button { font: inherit; color: inherit; }
   select {
     background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 6px 8px; font-size: 14px;
@@ -42,7 +42,7 @@
     background: var(--card); border: 1px solid var(--line); border-radius: 14px;
   }
   #transcript:empty::before {
-    content: "아래 버튼을 눌러 녹음을 시작하세요.\A 말하는 동안 녹음과 전사가 함께 진행되고, 한국어/영어는 문장마다 자동으로 감지돼요.";
+    content: "아래 버튼을 눌러 녹음을 시작하세요.\A 말하는 동안 빠른 전사가 바로 보이고, 녹음을 멈추면 더 정확한 모델로 30초씩 다시 전사해 바꿔 줘요.\A 한국어/영어는 자동으로 감지돼요.";
     white-space: pre-wrap; color: var(--muted);
   }
   .line { display: flex; gap: 10px; padding: 6px 0; border-bottom: 1px solid var(--line); }
@@ -52,6 +52,9 @@
   .badge.ko { background: var(--ko); } .badge.en { background: var(--en); }
   .text { flex: 1; word-break: keep-all; overflow-wrap: anywhere; }
   .pending .text { color: var(--muted); font-style: italic; }
+  /* 실시간 결과(초안)는 흐리게, 정밀 전사 중인 줄은 점선으로 표시 */
+  .line.draft .text { color: var(--muted); }
+  .line.refining .text { color: var(--muted); border-left: 2px dashed var(--accent); padding-left: 8px; }
   footer { padding: 12px 16px 16px; display: flex; align-items: center; gap: 10px; }
   #rec {
     flex: none; width: 68px; height: 68px; border-radius: 50%; border: 0; background: var(--rec);
@@ -92,6 +95,11 @@
     <option value="auto">GPU</option>
     <option value="wasm">CPU</option>
   </select>
+  <select id="precise" aria-label="녹음 후 정밀 전사">
+    <option value="onnx-community/whisper-small" selected>정밀 전사 (small)</option>
+    <option value="onnx-community/whisper-base">정밀 전사 (base)</option>
+    <option value="off">정밀 전사 끄기</option>
+  </select>
 </header>
 <div id="status">모델 준비 중…</div>
 <div id="bar"><div></div></div>
@@ -123,24 +131,42 @@ const store = {
 };
 
 // ---------- 워커 ----------
+// 워커 2개를 쓴다.
+//  - 실시간(live): 말이 끊길 때마다 짧은 구간을 빠른 모델로 바로 전사해 초안으로 보여 준다.
+//  - 정밀(precise): 녹음을 멈추면 같은 언어로 이어진 구간들을 최대 28초로 묶어 더 큰 모델로 다시 전사하고,
+//    해당 초안 줄들을 결과로 바꾼다. 짧게 잘린 구간보다 문맥이 길어 정확도가 올라간다.
 let worker, ready = false, nextId = 1, pendingCount = 0;
-const segEls = new Map();
-const lines = []; // {t, lang, text}
+let pworker = null, pready = false, pModel = null;
+const segEls = new Map();      // 실시간 전사 대기 중인 구간: id → {el, t}
+const groupEls = new Map();    // 정밀 전사 대기 중인 묶음: id → {el, t, segs}
+const segWaiters = new Map();  // 실시간 결과를 기다리는 정밀 전사: 구간 id → resolve
+const refiningSegs = new Set(); // 정밀 전사 중인 구간 id (해당 초안 줄을 점선으로 표시)
+const refinedSegs = new Set();  // 이미 정밀 결과로 바뀐 구간 id (늦게 온 실시간 결과는 버림)
+const lines = []; // {t, lang, text, seg?, fine?}
+let preciseTotal = 0, preciseDone = 0;
+
+// 모델 다운로드 진행률 표시 (워커마다 따로 셈)
+function progressHandler(label) {
+  const files = {};
+  return (m) => {
+    files[m.file] = m;
+    let l = 0, t = 0;
+    for (const f of Object.values(files)) { l += f.loaded; t += f.total; }
+    barEl.style.display = 'block';
+    barFill.style.width = (t ? (l / t) * 100 : 0) + '%';
+    statusEl.textContent = `${label} 모델 다운로드 중… ${(l / 1e6).toFixed(0)} / ${(t / 1e6).toFixed(0)} MB (처음 한 번만)`;
+  };
+}
 
 function startWorker() {
   ready = false; recBtn.disabled = true;
   worker?.terminate();
   worker = new Worker('worker.js', { type: 'module' });
-  const files = {};
+  const onProgress = progressHandler('실시간');
   worker.onmessage = (e) => {
     const m = e.data;
     if (m.type === 'progress') {
-      files[m.file] = m;
-      let l = 0, t = 0;
-      for (const f of Object.values(files)) { l += f.loaded; t += f.total; }
-      barEl.style.display = 'block';
-      barFill.style.width = (t ? (l / t) * 100 : 0) + '%';
-      statusEl.textContent = `모델 다운로드 중… ${(l / 1e6).toFixed(0)} / ${(t / 1e6).toFixed(0)} MB (처음 한 번만)`;
+      onProgress(m);
     } else if (m.type === 'status') {
       barEl.style.display = 'none';
       statusEl.textContent = m.text;
@@ -158,22 +184,66 @@ function startWorker() {
   worker.postMessage({ type: 'load', model: $('#model').value, device: $('#device').value });
 }
 
+// 정밀 전사 워커는 처음 쓸 때 만든다 (small은 처음 한 번 수백 MB를 내려받는다)
+function ensurePreciseWorker() {
+  const model = $('#precise').value;
+  if (model === 'off') return null;
+  if (pworker && pModel === model) return pworker;
+  pworker?.terminate();
+  pready = false; pModel = model;
+  pworker = new Worker('worker.js', { type: 'module' });
+  const onProgress = progressHandler('정밀 전사');
+  pworker.onmessage = (e) => {
+    const m = e.data;
+    if (m.type === 'progress') onProgress(m);
+    else if (m.type === 'status') { barEl.style.display = 'none'; statusEl.textContent = '정밀 전사: ' + m.text; }
+    else if (m.type === 'ready') { pready = true; barEl.style.display = 'none'; updateQueue(); }
+    else if (m.type === 'result') onPreciseResult(m);
+    else if (m.type === 'error') {
+      barEl.style.display = 'none';
+      statusEl.textContent = '정밀 전사 모델 로드 실패: ' + m.message + ' (실시간 결과는 그대로 둬요)';
+      failPrecise();
+    }
+  };
+  pworker.postMessage({ type: 'load', model, device: $('#device').value });
+  return pworker;
+}
+
+function stopPreciseWorker() {
+  pworker?.terminate(); pworker = null; pready = false; pModel = null;
+  failPrecise();
+}
+
+// 정밀 전사를 못 하게 되면 대기 중인 묶음을 풀고 초안을 그대로 둔다
+function failPrecise() {
+  for (const g of groupEls.values()) for (const s of g.segs) refiningSegs.delete(s.id);
+  groupEls.clear();
+  preciseTotal = preciseDone = 0;
+  render(); updateQueue();
+}
+
 const fmt = (s) => {
   s = Math.max(0, Math.floor(s));
   const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), x = s % 60;
   return (h ? h + ':' : '') + String(m).padStart(2, '0') + ':' + String(x).padStart(2, '0');
 };
 
-function sendSegment(samples, t) {
+// 정밀 전사에 다시 쓰려고 구간 소리를 16비트로 보관한다 (Float32의 절반 크기, 1시간 ≈ 115MB)
+const toInt16 = (f) => { const o = new Int16Array(f.length); for (let i = 0; i < f.length; i++) o[i] = Math.max(-1, Math.min(1, f[i])) * 32767; return o; };
+
+// session: 녹음 한 번(또는 파일 하나)의 구간 목록. 정밀 전사가 끝나면 버린다.
+function sendSegment(samples, t, session) {
   const id = nextId++;
   const el = document.createElement('div');
   el.className = 'line pending';
   el.innerHTML = `<div class="meta">${fmt(t)}</div><div class="text">전사 중…</div>`;
-  transcriptEl.append(el);
   segEls.set(id, { el, t });
+  if (session) {
+    session.push({ id, t, pcm: toInt16(samples), live: new Promise((res) => segWaiters.set(id, res)) });
+  }
   pendingCount++;
+  render();
   updateQueue();
-  scrollDown();
   worker.postMessage({ type: 'transcribe', id, audio: samples, lang: $('#lang').value }, [samples.buffer]);
 }
 
@@ -181,27 +251,127 @@ function onResult(m) {
   const seg = segEls.get(m.id);
   segEls.delete(m.id);
   pendingCount--;
+  const junk = !m.text || isJunk(m.text);
+  // 걸러낸 문구("Thank you." 등)도 실제 말일 수 있어서, 감지된 언어는 묶음 나누기에 그대로 쓴다
+  segWaiters.get(m.id)?.({ lang: m.lang, junk });
+  segWaiters.delete(m.id);
+  if (seg && !junk && !refinedSegs.has(m.id)) {
+    lines.push({ t: seg.t, lang: m.lang, text: cleanRepeats(m.text), seg: m.id });
+    lines.sort((a, b) => a.t - b.t);
+    persist();
+  }
+  render();
   updateQueue();
-  if (!seg) return;
-  if (!m.text || isJunk(m.text)) { seg.el.remove(); return; }
-  seg.el.className = 'line';
-  seg.el.innerHTML = `<div class="meta">${fmt(seg.t)}<br><span class="badge ${m.lang}">${m.lang.toUpperCase()}</span></div><div class="text"></div>`;
-  seg.el.querySelector('.text').textContent = m.text;
-  lines.push({ t: seg.t, lang: m.lang, text: m.text });
-  lines.sort((a, b) => a.t - b.t);
-  persist();
-  scrollDown();
+}
+
+// ---------- 녹음 후 정밀 전사 ----------
+const GROUP_MAX = 28;  // 초. Whisper는 30초 단위로 보므로 그 안에서 묶는다
+const GROUP_GAP = 6;   // 초. 이보다 오래 말이 없었으면 새 묶음 (시각 표시가 너무 어긋나지 않게)
+
+async function runPrecise(session) {
+  if (!session.length || !ensurePreciseWorker()) return;
+  // 실시간 결과의 언어로 묶음을 나눈다. 한 묶음 안에 한국어와 영어가 섞이면
+  // 하나의 언어로 강제돼 다른 언어 문장이 번역되거나 깨질 수 있기 때문이다.
+  const live = await Promise.all(session.map((s) => s.live));
+  if (!pworker) return; // 기다리는 동안 정밀 전사를 껐으면 중단
+  const groups = [];
+  let cur = null;
+  session.forEach((s, i) => {
+    const r = live[i];
+    const dur = s.pcm.length / SR;
+    const lastEnd = cur ? cur.segs.at(-1).t + cur.segs.at(-1).pcm.length / SR : 0;
+    const fits = cur && s.t + dur - cur.t <= GROUP_MAX && s.t - lastEnd <= GROUP_GAP;
+    const sameLang = !r.lang || !cur?.lang || r.lang === cur.lang;
+    if (!fits || !sameLang) { cur = { t: s.t, lang: null, segs: [], speech: false }; groups.push(cur); }
+    cur.segs.push(s);
+    if (r.lang) cur.lang = cur.lang || r.lang;
+    if (!r.junk) cur.speech = true;
+  });
+
+  for (const g of groups) {
+    if (!g.speech) continue; // 실시간에서 말이 하나도 안 나온 묶음은 건너뜀
+    // 구간 사이에 0.3초 무음을 넣어 이어 붙인다
+    const gap = Math.round(SR * 0.3);
+    const total = g.segs.reduce((n, s) => n + s.pcm.length, 0) + gap * (g.segs.length - 1);
+    const audio = new Float32Array(total);
+    let p = 0;
+    for (const s of g.segs) {
+      for (let i = 0; i < s.pcm.length; i++) audio[p + i] = s.pcm[i] / 32767;
+      p += s.pcm.length + gap;
+      s.pcm = null;
+      refiningSegs.add(s.id);
+    }
+    const id = nextId++;
+    const el = document.createElement('div');
+    el.className = 'line pending';
+    el.innerHTML = `<div class="meta">${fmt(g.t)}</div><div class="text">정밀 전사 대기…</div>`;
+    groupEls.set(id, { el, t: g.t, segs: g.segs });
+    preciseTotal++;
+    pworker.postMessage({ type: 'transcribe', id, audio, lang: $('#lang').value, maxTokens: 440 }, [audio.buffer]);
+  }
+  render();
+  updateQueue();
+}
+
+function onPreciseResult(m) {
+  const g = groupEls.get(m.id);
+  groupEls.delete(m.id);
+  if (!g) return;
+  preciseDone++;
+  const ids = new Set(g.segs.map((s) => s.id));
+  for (const id of ids) refiningSegs.delete(id);
+  const text = m.text ? cleanRepeats(m.text) : '';
+  // 정밀 결과가 비었거나 이상하면 초안을 그대로 둔다
+  if (!m.error && text && !isJunk(text)) {
+    for (const id of ids) {
+      refinedSegs.add(id);
+      const pending = segEls.get(id);
+      if (pending) { segEls.delete(id); }
+    }
+    for (let i = lines.length - 1; i >= 0; i--) if (ids.has(lines[i].seg)) lines.splice(i, 1);
+    lines.push({ t: g.t, lang: m.lang, text, fine: true });
+    lines.sort((a, b) => a.t - b.t);
+    persist();
+  }
+  if (!groupEls.size) preciseTotal = preciseDone = 0;
+  render();
+  updateQueue();
 }
 
 // Whisper가 무음에서 흔히 만들어내는 문구 걸러내기
 const JUNK = [/^\(.*\)$/, /^\[.*\]$/, /^♪+$/, /시청해\s*주셔서\s*감사합니다/, /구독과\s*좋아요/, /^thank you\.?$/i, /^thanks for watching/i, /^you$/i, /^\.+$/];
 const isJunk = (t) => JUNK.some((r) => r.test(t.trim()));
+// 긴 구간에서 Whisper가 같은 말을 계속 되풀이하는 경우가 있어, 3번 이상 연속 반복은 한 번으로 줄인다
+const cleanRepeats = (t) => t.replace(/(.{4,40}?)(?:[\s,.]*\1){2,}/g, '$1').trim();
 
 function updateQueue() {
   if (!ready) return;
-  statusEl.textContent = pendingCount > 0 ? `전사 대기 ${pendingCount}개` : (recording ? '녹음 중 · 말하면 바로 전사돼요' : '준비 완료');
+  const parts = [];
+  if (pendingCount > 0) parts.push(`전사 대기 ${pendingCount}개`);
+  if (groupEls.size) parts.push(pready ? `정밀 전사 ${preciseDone + 1}/${preciseTotal}` : '정밀 전사 모델 준비 중');
+  statusEl.textContent = parts.length ? parts.join(' · ') : (recording ? '녹음 중 · 말하면 바로 전사돼요' : '준비 완료');
   const has = lines.length > 0;
   $('#copy').disabled = $('#saveTxt').disabled = !has;
+}
+
+// 전사 줄과 대기 중인 줄을 시각 순서대로 다시 그린다
+function lineEl(l) {
+  const el = document.createElement('div');
+  const refining = l.seg != null && refiningSegs.has(l.seg);
+  el.className = 'line' + (refining ? ' refining' : l.fine || l.seg == null ? '' : ' draft');
+  el.innerHTML = `<div class="meta">${fmt(l.t)}<br><span class="badge ${l.lang}">${l.lang.toUpperCase()}</span></div><div class="text"></div>`;
+  el.querySelector('.text').textContent = l.text;
+  return el;
+}
+function render() {
+  const items = [
+    ...lines.map((l) => ({ t: l.t, el: lineEl(l) })),
+    ...segEls.values(),
+    ...groupEls.values(),
+  ];
+  items.sort((a, b) => a.t - b.t);
+  transcriptEl.replaceChildren(...items.map((i) => i.el));
+  scrollDown();
 }
 
 let stick = true;
@@ -214,16 +384,10 @@ const asText = () => lines.map((l) => `[${fmt(l.t)}] ${l.text}`).join('\n');
 function persist() { store.set('transcript', JSON.stringify(lines)); }
 function restore() {
   try {
-    const saved = JSON.parse(store.get('transcript', '[]'));
-    for (const l of saved) {
-      lines.push(l);
-      const el = document.createElement('div');
-      el.className = 'line';
-      el.innerHTML = `<div class="meta">${fmt(l.t)}<br><span class="badge ${l.lang}">${l.lang.toUpperCase()}</span></div><div class="text"></div>`;
-      el.querySelector('.text').textContent = l.text;
-      transcriptEl.append(el);
-    }
+    // 지난번에 정밀 전사를 마치지 못한 초안은 소리가 남아 있지 않으니 일반 줄로 보여 준다
+    for (const l of JSON.parse(store.get('transcript', '[]'))) lines.push({ t: l.t, lang: l.lang, text: l.text, fine: l.fine });
   } catch {}
+  render();
 }
 
 // ---------- 문장 단위로 자르기 (무음 기준) ----------
@@ -281,7 +445,7 @@ class Segmenter {
 
 // ---------- 녹음 ----------
 let recording = false, stream, ctx, node, mediaRecorder, recChunks = [], audioBlob = null;
-let segmenter, timerInt, t0, wakeLock, audioFrames = 0, watchdog;
+let segmenter, timerInt, t0, wakeLock, audioFrames = 0, watchdog, session = null;
 
 // 128샘플마다 메시지를 보내면 폰에서 부담이 커서 2048샘플씩 모아 보낸다
 const workletSrc = `
@@ -348,7 +512,10 @@ async function startRec() {
   const src = ctx.createMediaStreamSource(stream);
   node = new AudioWorkletNode(ctx, 'tap');
   const base = lines.length ? Math.ceil(lines[lines.length - 1].t + 5) : 0;
-  segmenter = new Segmenter((s, t) => sendSegment(s, base + t));
+  // 정밀 전사가 켜져 있으면 구간 소리를 모아 두었다가 녹음을 멈출 때 다시 전사한다
+  const sess = session = $('#precise').value === 'off' ? null : [];
+  if (sess) ensurePreciseWorker(); // 녹음하는 동안 미리 모델을 받아 둔다
+  segmenter = new Segmenter((s, t) => sendSegment(s, base + t, sess));
   segmenter.level = (rms) => (meterFill.style.width = Math.min(100, rms * 600) + '%');
   const resample = makeResampler(ctx.sampleRate, SR);
   audioFrames = 0;
@@ -380,6 +547,7 @@ function stopRec() {
   clearInterval(timerInt);
   clearTimeout(watchdog);
   segmenter?.flush();
+  if (session) { runPrecise(session); session = null; }
   node?.disconnect(); ctx?.close();
   mediaRecorder?.state !== 'inactive' && mediaRecorder.stop();
   stream?.getTracks().forEach((t) => t.stop());
@@ -411,9 +579,11 @@ $('#file').onchange = async (e) => {
     actx.close();
     const data = decoded.getChannelData(0);
     const base = lines.length ? Math.ceil(lines[lines.length - 1].t + 5) : 0;
-    const seg = new Segmenter((s, t) => sendSegment(s, base + t));
+    const sess = $('#precise').value === 'off' ? null : [];
+    const seg = new Segmenter((s, t) => sendSegment(s, base + t, sess));
     for (let i = 0; i < data.length; i += SR) seg.push(data.slice(i, i + SR));
     seg.flush();
+    if (sess) runPrecise(sess);
   } catch (err) {
     statusEl.textContent = '이 파일은 읽을 수 없어요: ' + err.message;
   }
@@ -436,7 +606,7 @@ $('#saveTxt').onclick = () => download(new Blob([asText()], { type: 'text/plain;
 $('#saveAudio').onclick = () => audioBlob && download(audioBlob, `녹음-${stamp()}.${audioBlob.type.includes('mp4') ? 'm4a' : 'webm'}`);
 $('#clear').onclick = () => {
   if (lines.length && !confirm('전사 내용을 모두 지울까요?')) return;
-  lines.length = 0; transcriptEl.innerHTML = ''; persist(); updateQueue();
+  lines.length = 0; persist(); render(); updateQueue();
 };
 
 $('#lang').value = store.get('lang', 'auto');
@@ -448,7 +618,13 @@ $('#model').onchange = $('#device').onchange = () => {
   store.set('model', $('#model').value);
   store.set('device', $('#device').value);
   statusEl.textContent = '모델 바꾸는 중…';
+  stopPreciseWorker();
   startWorker();
+};
+$('#precise').value = store.get('precise', 'onnx-community/whisper-small');
+$('#precise').onchange = () => {
+  store.set('precise', $('#precise').value);
+  stopPreciseWorker(); // 다음에 녹음을 멈출 때 새 설정으로 다시 준비한다
 };
 
 restore();
