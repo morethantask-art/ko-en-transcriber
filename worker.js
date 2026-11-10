@@ -148,7 +148,24 @@ async function load(modelId, preferred) {
     await loadModel(modelId, device, progress_callback);
     test = await selfTest();
   }
+  current = { modelId, device };
   self.postMessage({ type: 'ready', device, selftest: test });
+}
+
+// GPU가 첫 전사만 빠르고 그다음부터 매번 30초씩 걸리는 PC가 있었다 (CPU는 같은 10초 소리를 3초에 처리).
+// 브라우저가 GPU 작업을 늦추는 경우라 미리 알 수 없어서, 전사할 때마다 시간을 재고
+// 4초 넘게 걸리고 소리 길이의 2배를 넘기면 CPU로 바꾼다. 한 번 바꾸면 이 워커에서는 다시 GPU로 가지 않는다.
+let current = null;
+async function checkGpuSpeed(ms, samples) {
+  if (current?.device !== 'webgpu') return;
+  const audioMs = (samples / 16000) * 1000;
+  if (ms < 4000 || ms < audioMs * 2) return;
+  self.postMessage({ type: 'status', text: 'GPU가 느려서 CPU로 바꾸는 중…' });
+  try { await model?.dispose(); } catch {}
+  const progress_callback = () => {};
+  await loadModel(current.modelId, 'wasm', progress_callback);
+  current.device = 'wasm';
+  self.postMessage({ type: 'device', device: 'wasm', reason: 'slow-gpu' });
 }
 
 // maxTokens: 실시간 짧은 구간은 200이면 충분하고, 녹음 후 정밀 전사(최대 30초)는 더 길게 쓴다.
@@ -177,6 +194,8 @@ async function transcribe(audio, langMode, maxTokens = 200, prompt = '') {
     no_repeat_ngram_size: 0,
   });
   const seq = out.tolist()[0].map(Number).slice(prefix.length);
+  // GPU에서는 다 쓴 텐서를 직접 풀어 줘야 한다. 안 풀면 두 번째 전사부터 10배 넘게 느려졌다(PC에서 확인)
+  for (const t of [out, ...Object.values(inputs)]) { try { t?.dispose?.(); } catch {} }
   const lang = seq[1] === tok.ko ? 'ko' : 'en';
   const text = tokenizer.decode(seq, { skip_special_tokens: true }).trim();
   // 말이 거의 없는 구간에서는 힌트 목록을 그대로 받아 적는 경우가 있어서, 그러면 힌트 없이 다시 한다
@@ -210,7 +229,9 @@ self.onmessage = (e) => {
       try {
         const t0 = performance.now();
         const r = await transcribe(msg.audio, msg.lang, msg.maxTokens, msg.prompt);
-        self.postMessage({ type: 'result', id: msg.id, ...r, ms: performance.now() - t0 });
+        const ms = performance.now() - t0;
+        self.postMessage({ type: 'result', id: msg.id, ...r, ms });
+        await checkGpuSpeed(ms, msg.audio.length);
       } catch (err) {
         self.postMessage({ type: 'result', id: msg.id, lang: null, text: '', error: String(err?.message || err) });
       }

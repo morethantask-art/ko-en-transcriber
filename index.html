@@ -192,6 +192,15 @@ const store = {
 let worker, ready = false, nextId = 1, pendingCount = 0;
 let pworker = null, pready = false, pModel = null;
 let liveDevice = null; // 'webgpu' | 'wasm'
+let gpuFallback = false; // GPU가 느려서 CPU로 바꿨는지
+let pDevice = null;
+// 'GPU'를 골랐어도, 이 기기에서 GPU가 느렸던 적이 있으면 CPU로 시작한다.
+// (처리 방식을 다시 고르면 그 기억을 지우고 GPU를 다시 시도한다)
+function engineDevice() {
+  const v = $('#device').value;
+  if (v === 'auto' && (gpuFallback || store.get('gpuSlow', '') === '1')) return 'wasm';
+  return v;
+}
 const segEls = new Map();      // 실시간 전사 대기 중인 구간: id → {el, t}
 const groupEls = new Map();    // 정밀 전사 대기 중인 묶음: id → {el, t, segs}
 const segWaiters = new Map();  // 실시간 결과를 기다리는 정밀 전사: 구간 id → resolve
@@ -214,7 +223,7 @@ function progressHandler(label) {
 }
 
 function startWorker() {
-  ready = false; recBtn.disabled = true;
+  ready = false; recBtn.disabled = true; gpuFallback = false;
   worker?.terminate();
   worker = new Worker('worker.js', { type: 'module' });
   const onProgress = progressHandler('실시간');
@@ -231,13 +240,19 @@ function startWorker() {
       statusEl.textContent = m.selftest?.ok
         ? `준비 완료 · ${m.device === 'webgpu' ? 'GPU 가속' : 'CPU'} 사용`
         : `준비됐지만 자체 점검 결과가 이상해요 (${m.device}): "${m.selftest?.text || ''}"`;
+    } else if (m.type === 'device') {
+      // GPU가 너무 느려서 엔진이 스스로 CPU로 바꿨다
+      liveDevice = m.device;
+      gpuFallback = true;
+      store.set('gpuSlow', '1'); // 다음에 켤 때는 처음부터 CPU로
+      updateQueue();
     } else if (m.type === 'result') {
-      onResult(m);
+      if (typeof m.id === 'string') onPartialResult(m); else onResult(m);
     } else if (m.type === 'error') {
       statusEl.textContent = '모델 로드 실패: ' + m.message;
     }
   };
-  worker.postMessage({ type: 'load', model: $('#model').value, device: $('#device').value });
+  worker.postMessage({ type: 'load', model: $('#model').value, device: engineDevice() });
 }
 
 // 정밀 전사 워커는 처음 쓸 때 만든다 (small은 처음 한 번 수백 MB를 내려받는다)
@@ -251,7 +266,7 @@ function preciseModel() {
 function ensurePreciseWorker() {
   const model = preciseModel();
   if (model === 'off') return null;
-  if (pworker && pModel === model) return pworker;
+  if (pworker && pModel === model && pDevice === engineDevice()) return pworker;
   pworker?.terminate();
   pready = false; pModel = model;
   pworker = new Worker('worker.js', { type: 'module' });
@@ -268,7 +283,8 @@ function ensurePreciseWorker() {
       failPrecise();
     }
   };
-  pworker.postMessage({ type: 'load', model, device: $('#device').value });
+  pDevice = engineDevice();
+  pworker.postMessage({ type: 'load', model, device: pDevice });
   return pworker;
 }
 
@@ -294,12 +310,39 @@ const fmt = (s) => {
 // 정밀 전사에 다시 쓰려고 구간 소리를 16비트로 보관한다 (Float32의 절반 크기, 1시간 ≈ 115MB)
 const toInt16 = (f) => { const o = new Int16Array(f.length); for (let i = 0; i < f.length; i++) o[i] = Math.max(-1, Math.min(1, f[i])) * 32767; return o; };
 
+// ---------- 말하는 중 미리보기 ----------
+// 구간이 끝나기 전에도 지금까지의 소리를 전사해 회색 글씨로 보여 준다.
+// 엔진이 다른 일을 하고 있으면 건너뛰어서, 미리보기 때문에 확정 전사가 밀리지 않게 한다.
+let interim = null; // {t, el, id}
+let partialInFlight = false, partialSeq = 0;
+function pendingEl(t, text) {
+  const el = document.createElement('div');
+  el.className = 'line pending';
+  el.innerHTML = `<div class="meta">${fmt(t)}</div><div class="text"></div>`;
+  el.querySelector('.text').textContent = text;
+  return el;
+}
+function sendPartial(samples, t) {
+  if (!ready || partialInFlight || pendingCount > 0) return;
+  partialInFlight = true;
+  if (!interim || interim.t !== t) { interim = { t, el: pendingEl(t, '듣는 중…') }; render(); }
+  interim.id = 'p' + ++partialSeq;
+  worker.postMessage({ type: 'transcribe', id: interim.id, audio: samples, lang: $('#lang').value, prompt: hintText(60, false) }, [samples.buffer]);
+}
+function onPartialResult(m) {
+  partialInFlight = false;
+  if (!interim || interim.id !== m.id || !m.text || isJunk(m.text)) return;
+  interim.text = applyLearned(cleanRepeats(m.text));
+  interim.el.querySelector('.text').textContent = interim.text + ' …';
+}
+
 // session: 녹음 한 번(또는 파일 하나)의 구간 목록. 정밀 전사가 끝나면 버린다.
 function sendSegment(samples, t, session) {
   const id = nextId++;
-  const el = document.createElement('div');
-  el.className = 'line pending';
-  el.innerHTML = `<div class="meta">${fmt(t)}</div><div class="text">전사 중…</div>`;
+  // 미리보기가 있던 구간이면 확정될 때까지 그 글씨를 그대로 보여 준다
+  const preview = interim && interim.t === t && interim.text;
+  interim = null;
+  const el = pendingEl(t, preview ? preview + ' …' : '전사 중…');
   segEls.set(id, { el, t });
   if (session) {
     session.push({ id, t, pcm: toInt16(samples), live: new Promise((res) => segWaiters.set(id, res)) });
@@ -692,7 +735,7 @@ function updateQueue() {
   if (groupEls.size) parts.push(pready ? `정밀 전사 ${preciseDone + 1}/${preciseTotal} (${(pModel || '').split('-').pop()})` : '정밀 전사 모델 준비 중');
   const cat = currentCategory();
   const catText = cat ? ` · 상황: ${CATEGORIES[cat].label}${$('#category').value === 'auto' ? ' (자동)' : ''}` : '';
-  const dev = liveDevice ? ` · ${liveDevice === 'webgpu' ? 'GPU' : 'CPU'}${liveDevice === 'wasm' && window.crossOriginIsolated ? ' 여러 스레드' : ''}` : '';
+  const dev = liveDevice ? ` · ${liveDevice === 'webgpu' ? 'GPU' : 'CPU'}${liveDevice === 'wasm' && window.crossOriginIsolated ? ' 여러 스레드' : ''}${liveDevice === 'wasm' && $('#device').value === 'auto' ? ' (이 기기는 GPU가 느려서 CPU 사용)' : ''}` : '';
   statusEl.textContent = (parts.length ? parts.join(' · ') : (recording ? '녹음 중 · 말하면 바로 전사돼요' : '준비 완료')) + dev + catText;
   const has = lines.length > 0;
   $('#copy').disabled = $('#saveTxt').disabled = !has;
@@ -715,6 +758,7 @@ function render() {
     ...lines.map((l) => ({ t: l.t, el: lineEl(l) })),
     ...segEls.values(),
     ...groupEls.values(),
+    ...(interim ? [interim] : []),
   ];
   items.sort((a, b) => a.t - b.t);
   transcriptEl.replaceChildren(...items.map((i) => i.el));
@@ -739,15 +783,21 @@ function restore() {
 
 // ---------- 문장 단위로 자르기 (무음 기준) ----------
 // 100ms 프레임 단위로 소리 크기를 보고, 말이 끝난 뒤 잠깐 조용해지면 잘라서 전사로 보낸다.
+// 쉬지 않고 계속 말하면 MAX_SEG초에서 자르는데, 낱말 중간이 잘리지 않게 마지막 2초 중 가장 조용한 곳에서 자른다.
+// (예전엔 25초까지 기다려서, 이어서 말하면 첫 글자가 30초 가까이 늦게 나왔다)
+// onPartial: 말하는 중에 지금까지의 소리를 미리보기로 전사하라고 PARTIAL_EVERY초마다 알린다.
+const MAX_SEG = 10, PARTIAL_EVERY = 2.5;
 class Segmenter {
-  constructor(onSegment) {
+  constructor(onSegment, onPartial) {
     this.onSegment = onSegment;
+    this.onPartial = onPartial;
     this.frame = SR / 10;
     this.buf = new Float32Array(0);
-    this.chunks = []; this.len = 0;
+    this.chunks = []; this.len = 0; // chunks: {d: 소리, rms, speech}
     this.offset = 0;        // 현재 구간 시작 시각(초)
     this.silentFrames = 0; this.speechFrames = 0;
     this.noise = 0.002;
+    this.lastPartial = 0;
   }
   push(samples) {
     const b = new Float32Array(this.buf.length + samples.length);
@@ -763,30 +813,55 @@ class Segmenter {
     if (!speech) this.noise = this.noise * 0.95 + rms * 0.05;
     this.level?.(rms);
 
-    this.chunks.push(f.slice()); this.len += f.length;
+    this.chunks.push({ d: f.slice(), rms, speech }); this.len += f.length;
     if (speech) { this.speechFrames++; this.silentFrames = 0; } else this.silentFrames++;
 
     const dur = this.len / SR;
     // 말 없이 조용한 구간이 길어지면 앞부분을 버리고 시작점을 당긴다
     if (this.speechFrames === 0 && this.chunks.length > 5) {
-      const drop = this.chunks.shift(); this.len -= drop.length; this.offset += drop.length / SR;
+      const drop = this.chunks.shift(); this.len -= drop.d.length; this.offset += drop.d.length / SR;
       return;
     }
-    if ((this.speechFrames >= 3 && this.silentFrames >= 7 && dur >= 1.5) || dur >= 25) this.cut();
+    if (this.speechFrames >= 3 && this.silentFrames >= 7 && dur >= 1.5) { this.cut(this.chunks.length); return; }
+    if (dur >= MAX_SEG) {
+      // 마지막 2초(20프레임) 중 가장 조용한 프레임 뒤에서 자르고, 나머지는 다음 구간으로 넘긴다
+      let q = this.chunks.length - 1;
+      for (let k = Math.max(1, this.chunks.length - 20); k < this.chunks.length; k++) if (this.chunks[k].rms < this.chunks[q].rms) q = k;
+      this.cut(q + 1);
+      return;
+    }
+    // 말하는 중이면 미리보기 전사를 요청한다
+    if (this.onPartial && this.speechFrames >= 3 && dur - this.lastPartial >= PARTIAL_EVERY) {
+      this.lastPartial = dur;
+      this.onPartial(this.joined(this.chunks.length), this.offset);
+    }
   }
-  cut() {
-    if (this.len === 0) return;
-    const out = new Float32Array(this.len);
-    let p = 0; for (const c of this.chunks) { out.set(c, p); p += c.length; }
+  joined(n) {
+    let size = 0; for (let k = 0; k < n; k++) size += this.chunks[k].d.length;
+    const out = new Float32Array(size);
+    let p = 0; for (let k = 0; k < n; k++) { out.set(this.chunks[k].d, p); p += this.chunks[k].d.length; }
+    return out;
+  }
+  // 앞의 n프레임을 한 구간으로 보내고, 뒤는 남긴다
+  cut(n) {
+    if (this.len === 0 || n <= 0) return;
+    const out = this.joined(n);
     const start = this.offset;
-    this.offset += this.len / SR;
-    const hadSpeech = this.speechFrames >= 3;
-    this.chunks = []; this.len = 0; this.speechFrames = 0; this.silentFrames = 0;
+    const hadSpeech = this.chunks.slice(0, n).filter((c) => c.speech).length >= 3;
+    this.chunks = this.chunks.slice(n);
+    this.len -= out.length;
+    this.offset += out.length / SR;
+    this.speechFrames = this.chunks.filter((c) => c.speech).length;
+    this.silentFrames = 0;
+    for (let k = this.chunks.length - 1; k >= 0 && !this.chunks[k].speech; k--) this.silentFrames++;
+    this.lastPartial = 0;
     if (hadSpeech) this.onSegment(out, start);
   }
   flush() {
-    if (this.buf.length) { this.chunks.push(this.buf); this.len += this.buf.length; this.buf = new Float32Array(0); }
-    this.cut();
+    if (this.buf.length) {
+      this.chunks.push({ d: this.buf, rms: 0, speech: false }); this.len += this.buf.length; this.buf = new Float32Array(0);
+    }
+    this.cut(this.chunks.length);
   }
 }
 
@@ -862,7 +937,7 @@ async function startRec() {
   // 정밀 전사가 켜져 있으면 구간 소리를 모아 두었다가 녹음을 멈출 때 다시 전사한다
   const sess = session = $('#precise').value === 'off' ? null : [];
   // 정밀 전사 모델은 녹음을 멈춘 뒤에 준비한다. 녹음 중에 준비하면 실시간 전사와 CPU를 나눠 써서 느려진다
-  segmenter = new Segmenter((s, t) => sendSegment(s, base + t, sess));
+  segmenter = new Segmenter((s, t) => sendSegment(s, base + t, sess), (s, t) => sendPartial(s, base + t));
   segmenter.level = (rms) => (meterFill.style.width = Math.min(100, rms * 600) + '%');
   const resample = makeResampler(ctx.sampleRate, SR);
   audioFrames = 0;
@@ -960,6 +1035,7 @@ $('#lang').value = store.get('lang', 'auto');
 $('#model').value = store.get('model', 'onnx-community/whisper-base');
 $('#lang').onchange = () => store.set('lang', $('#lang').value);
 $('#device').value = store.get('device', 'auto');
+$('#device').addEventListener('change', () => { store.set('gpuSlow', ''); gpuFallback = false; });
 $('#model').onchange = $('#device').onchange = () => {
   if (recording) stopRec();
   store.set('model', $('#model').value);
