@@ -42,7 +42,7 @@
     background: var(--card); border: 1px solid var(--line); border-radius: 14px;
   }
   #transcript:empty::before {
-    content: "아래 버튼을 눌러 녹음을 시작하세요.\A 말하는 동안 빠른 전사가 바로 보이고, 녹음을 멈추면 더 정확한 모델로 30초씩 다시 전사해 바꿔 줘요.\A 한국어/영어는 자동으로 감지돼요.";
+    content: "아래 버튼을 눌러 녹음을 시작하세요.\A 말하는 동안 빠른 전사가 바로 보이고, 녹음을 멈추면 더 정확한 모델로 30초씩 다시 전사해 바꿔 줘요.\A 한국어/영어는 자동으로 감지돼요.\A 틀린 줄은 눌러서 고치면, 고친 말을 기억했다가 다음 전사에 반영해요.";
     white-space: pre-wrap; color: var(--muted);
   }
   .line { display: flex; gap: 10px; padding: 6px 0; border-bottom: 1px solid var(--line); }
@@ -55,6 +55,34 @@
   /* 실시간 결과(초안)는 흐리게, 정밀 전사 중인 줄은 점선으로 표시 */
   .line.draft .text { color: var(--muted); }
   .line.refining .text { color: var(--muted); border-left: 2px dashed var(--accent); padding-left: 8px; }
+  /* 줄을 눌러 고치기 */
+  .line:not(.pending) .text { cursor: text; }
+  .line.edited .text { text-decoration: underline dotted var(--accent); text-underline-offset: 4px; }
+  .line textarea {
+    flex: 1; font: inherit; color: inherit; background: var(--bg); border: 1px solid var(--accent);
+    border-radius: 8px; padding: 4px 6px; resize: vertical; min-height: 3em;
+  }
+  .edit-hint { font-size: 12px; color: var(--muted); margin-top: 2px; }
+  /* 고친 말 목록 */
+  dialog {
+    width: min(520px, calc(100vw - 32px)); max-height: 80vh; border: 1px solid var(--line); border-radius: 14px;
+    background: var(--card); color: var(--text); padding: 14px 16px;
+  }
+  dialog::backdrop { background: rgb(0 0 0 / .4); }
+  dialog h2 { font-size: 16px; margin: 0 0 4px; }
+  dialog p { font-size: 13px; color: var(--muted); margin: 0 0 10px; }
+  #learnList { list-style: none; margin: 0; padding: 0; overflow-y: auto; max-height: 50vh; }
+  #learnList li { display: flex; align-items: center; gap: 8px; padding: 6px 0; border-bottom: 1px solid var(--line); font-size: 14px; }
+  #learnList .pair { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+  #learnList .from { color: var(--muted); text-decoration: line-through; }
+  #learnList .n { font-size: 12px; color: var(--muted); flex: none; }
+  #learnList:empty::before { content: "아직 고친 말이 없어요. 전사된 줄을 눌러 고치면 여기에 쌓여요."; color: var(--muted); font-size: 13px; }
+  dialog .row { display: flex; gap: 8px; justify-content: flex-end; margin-top: 12px; }
+  dialog button { background: var(--card); border: 1px solid var(--line); border-radius: 9px; padding: 5px 12px; font-size: 13px; cursor: pointer; }
+  #learnList button { padding: 2px 8px; }
+  #learnList .cat { min-width: 2.5em; text-align: right; }
+  dialog .add { display: flex; gap: 6px; margin-bottom: 8px; }
+  dialog .add input { flex: 1; min-width: 0; font: inherit; font-size: 14px; color: inherit; background: var(--bg); border: 1px solid var(--line); border-radius: 9px; padding: 5px 8px; }
   footer { padding: 12px 16px 16px; display: flex; align-items: center; gap: 10px; }
   #rec {
     flex: none; width: 68px; height: 68px; border-radius: 50%; border: 0; background: var(--rec);
@@ -100,6 +128,14 @@
     <option value="onnx-community/whisper-base">정밀 전사 (base)</option>
     <option value="off">정밀 전사 끄기</option>
   </select>
+  <select id="category" aria-label="상황">
+    <option value="auto">상황: 자동</option>
+    <option value="church">상황: 교회 · 예배</option>
+    <option value="hospital">상황: 병원 · 진료</option>
+    <option value="meeting">상황: 회의 · 업무</option>
+    <option value="class">상황: 수업 · 강의</option>
+    <option value="none">상황: 구분 안 함</option>
+  </select>
 </header>
 <div id="status">모델 준비 중…</div>
 <div id="bar"><div></div></div>
@@ -114,10 +150,27 @@
       <button id="saveTxt" disabled>텍스트 저장</button>
       <button id="saveAudio" disabled>녹음 파일 저장</button>
       <label id="fileLabel">파일 전사<input id="file" type="file" accept="audio/*,video/*"></label>
+      <button id="learnBtn">고친 말</button>
       <button id="clear">지우기</button>
     </div>
   </div>
 </footer>
+
+<dialog id="learnDlg">
+  <h2>고친 말</h2>
+  <p>전사된 줄을 눌러 고치면, 잘못 들린 말과 고친 말이 여기에 기록돼요.
+     다음부터는 고친 말을 전사 엔진에 힌트로 주고, 같은 글자로 잘못 들리면 자동으로 바꿔요.
+     고른 상황(또는 자동으로 알아낸 상황)의 어휘도 함께 힌트로 줘요.</p>
+  <form id="learnAdd" class="add">
+    <input id="learnWord" placeholder="자주 나오는 이름·용어 미리 넣기 (예: 요기이소)" autocomplete="off">
+    <button>넣기</button>
+  </form>
+  <ul id="learnList"></ul>
+  <div class="row">
+    <button id="learnClear">모두 지우기</button>
+    <button id="learnClose">닫기</button>
+  </div>
+</dialog>
 
 <script>
 const $ = (s) => document.querySelector(s);
@@ -244,7 +297,7 @@ function sendSegment(samples, t, session) {
   pendingCount++;
   render();
   updateQueue();
-  worker.postMessage({ type: 'transcribe', id, audio: samples, lang: $('#lang').value }, [samples.buffer]);
+  worker.postMessage({ type: 'transcribe', id, audio: samples, lang: $('#lang').value, prompt: hintText() }, [samples.buffer]);
 }
 
 function onResult(m) {
@@ -256,13 +309,284 @@ function onResult(m) {
   segWaiters.get(m.id)?.({ lang: m.lang, junk });
   segWaiters.delete(m.id);
   if (seg && !junk && !refinedSegs.has(m.id)) {
-    lines.push({ t: seg.t, lang: m.lang, text: cleanRepeats(m.text), seg: m.id });
+    lines.push({ t: seg.t, lang: m.lang, text: applyLearned(cleanRepeats(m.text)), seg: m.id });
     lines.sort((a, b) => a.t - b.t);
     persist();
   }
   render();
   updateQueue();
 }
+
+// ---------- 고치기와 고친 말 기억 ----------
+// 전사된 줄을 눌러 고치면 고치기 전/후를 비교해 바뀐 조각(잘못 들린 말 → 고친 말)을 기록한다.
+// Whisper는 같은 소리를 들으면 같은 식으로 잘못 적는 경향이 있어서, 잘못 적힌 글자가 곧 그 소리의 흔적이다.
+// 기록은 두 가지로 쓴다.
+//  1) 힌트: 고친 말을 전사 엔진의 '앞 문맥'으로 넣어, 비슷한 소리를 들으면 그 표기를 고르게 한다.
+//  2) 자동 바꾸기: 그래도 같은 글자로 잘못 적히면 결과에서 고친 말로 바꾼다 (띄어쓰기는 무시하고 비교).
+let editing = null, renderQueued = false;
+const editedSegs = new Set(); // 사용자가 고친 실시간 구간 (정밀 전사가 덮어쓰지 않게)
+let learned = [];
+try { learned = JSON.parse(store.get('learned', '[]')).filter((r) => r.kind); } catch {}
+const saveLearned = () => { store.set('learned', JSON.stringify(learned)); updateLearnBtn(); };
+
+const PUNCT_CH = /[.,!?。、·"'“”‘’()\[\]…:;~\-]/;
+const PUNCT = new RegExp(PUNCT_CH.source, 'g');
+const bare = (w) => w.toLowerCase().replace(PUNCT, '');
+const words = (s) => s.split(/\s+/).filter(Boolean);
+const EDGE_PUNCT = /^[.,!?·"'“”‘’()\[\]…:;~\-]+|[.,!?·"'“”‘’()\[\]…:;~\-]+$/g;
+const clean = (s) => s.replace(EDGE_PUNCT, '').trim();
+
+// 띄어쓰기·문장부호를 뺀 글자열과, 각 글자가 원문 어디에 있었는지
+function squash(s) {
+  let n = '';
+  const pos = [];
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (/\s/.test(c) || PUNCT_CH.test(c)) continue;
+    n += c.toLowerCase();
+    pos.push(i);
+  }
+  return { n, pos };
+}
+
+// 낱말 끝의 조사를 떼어 힌트 낱말로 쓴다 ("이미지슬림을" → "이미지슬림")
+const JOSA = ['에서', '에게', '한테', '으로', '까지', '부터', '처럼', '보다', '로', '을', '를', '이', '가', '은', '는', '의', '에', '와', '과', '도', '만'];
+function stripJosa(w) {
+  for (const j of JOSA) if (w.endsWith(j) && w.length - j.length >= 2) return w.slice(0, -j.length);
+  return w;
+}
+
+// LCS로 차이를 찾는다. unit: 'word'면 낱말 배열, 'char'면 글자열
+function lcsOps(a, b) {
+  const L = Array.from({ length: a.length + 1 }, () => new Int32Array(b.length + 1));
+  for (let i = a.length - 1; i >= 0; i--)
+    for (let j = b.length - 1; j >= 0; j--)
+      L[i][j] = a[i] === b[j] ? L[i + 1][j + 1] + 1 : Math.max(L[i + 1][j], L[i][j + 1]);
+  const ops = [];
+  let i = 0, j = 0;
+  while (i < a.length || j < b.length) {
+    if (i < a.length && j < b.length && a[i] === b[j]) { ops.push(['=', i++, j++]); }
+    else if (j < b.length && (i === a.length || L[i][j + 1] >= L[i + 1][j])) ops.push(['+', i, j++]);
+    else ops.push(['-', i++, j]);
+  }
+  return ops;
+}
+
+// 낱말 단위로 바뀐 덩어리
+function wordBlocks(oldText, newText) {
+  const a = words(oldText), b = words(newText);
+  const blocks = [];
+  let fa = [], fb = [];
+  const flush = () => { if (fa.length || fb.length) blocks.push({ from: fa, to: fb }); fa = []; fb = []; };
+  for (const [op, i, j] of lcsOps(a.map(bare), b.map(bare))) {
+    if (op === '=') flush();
+    else if (op === '+') fb.push(b[j]);
+    else fa.push(a[i]);
+  }
+  flush();
+  return blocks;
+}
+
+// 글자 단위로 바뀐 조각. 2글자 이상 같은 부분에서 끊고, 1글자만 같은 건 바뀐 조각에 포함한다
+function charPieces(a, b) {
+  const ops = lcsOps(a, b);
+  const pieces = [];
+  let cur = null, eq = [];
+  const close = () => { if (cur) pieces.push(cur); cur = null; };
+  const absorb = () => {
+    for (const [, i, j] of eq) { cur.x += a[i]; cur.y += b[j]; cur.ye = j + 1; cur.xe = i + 1; }
+    eq = [];
+  };
+  for (const op of ops) {
+    if (op[0] === '=') { if (cur) eq.push(op); continue; }
+    if (cur && eq.length) { if (eq.length >= 2) { close(); eq = []; } else absorb(); }
+    if (!cur) cur = { x: '', y: '', xs: op[1], xe: op[1], ys: op[2], ye: op[2] };
+    if (op[0] === '-') { cur.x += a[op[1]]; cur.xe = op[1] + 1; }
+    else { cur.y += b[op[2]]; cur.ye = op[2] + 1; }
+  }
+  close();
+  return pieces;
+}
+
+function addRule(rule) {
+  const { from, to } = rule;
+  if (!to) return false;
+  // 같은 잘못 들린 말에 대한 예전 규칙과, 방금 것을 되돌리는 규칙은 지운다
+  learned = learned.filter((r) =>
+    !(from && r.from === from && r.to !== to) && !(r.from && r.from === squash(to).n && squash(r.to).n === from));
+  const hit = learned.find((r) => r.from === from && r.to === to);
+  if (hit) { hit.n++; hit.at = Date.now(); hit.cat = rule.cat; }
+  else learned.push({ ...rule, n: 1, at: Date.now() });
+  return true;
+}
+
+function learnFrom(oldText, newText, lang) {
+  let changed = false;
+  const cat = currentCategory();
+  for (const blk of wordBlocks(oldText, newText)) {
+    if (!blk.to.length || blk.from.length > 10 || blk.to.length > 10) continue; // 지운 말, 통째로 다시 쓴 문장은 건너뜀
+    const oldStr = blk.from.join(' '), newStr = clean(blk.to.join(' '));
+    if (!blk.from.length) { changed = addRule({ kind: 'hint', from: '', show: '', to: newStr, lang, cat }) || changed; continue; }
+    const A = squash(oldStr), B = squash(newStr);
+    // 1) 글자가 바뀐 조각: "여기iso둘째" → "요기이소 툴즈"
+    for (const p of charPieces(A.n, B.n)) {
+      if (!p.y) continue;
+      const to = clean(newStr.slice(B.pos[p.ys], B.pos[p.ye - 1] + 1));
+      const show = p.x ? oldStr.slice(A.pos[p.xs], A.pos[p.xe - 1] + 1) : '';
+      changed = addRule({ kind: p.x.length >= 2 ? 'char' : 'hint', from: p.x.length >= 2 ? p.x : '', show, to, lang, cat }) || changed;
+    }
+    // 2) 띄어쓰기만 바뀐 낱말: "이미지 슬림" → "이미지슬림"
+    const oldBare = new Set(blk.from.map((w) => stripJosa(bare(w))));
+    for (const w of blk.to) {
+      const t = stripJosa(clean(w)), tb = squash(t).n;
+      const at = A.n.indexOf(tb);
+      if (tb.length >= 3 && !oldBare.has(tb) && at >= 0) {
+        const show = oldStr.slice(A.pos[at], A.pos[at + tb.length - 1] + 1);
+        changed = addRule({ kind: 'char', from: tb, show, to: t, lang, cat }) || changed;
+      }
+    }
+  }
+  if (changed) saveLearned();
+}
+
+// 결과에 잘못 들린 글자가 그대로 나오면 고친 말로 바꾼다. 띄어쓰기·문장부호는 무시하고 찾는다.
+// 2글자짜리는 다른 낱말 속에서 잘못 바뀔 수 있어서 3글자 이상만 바꾼다 (2글자는 힌트로만 쓴다).
+function applyLearned(text) {
+  const rules = learned.filter((r) => r.kind === 'char' && r.from.length >= 3).sort((x, y) => y.from.length - x.from.length);
+  for (const r of rules) {
+    const { n, pos } = squash(text);
+    const hits = [];
+    for (let i = n.indexOf(r.from); i >= 0; i = n.indexOf(r.from, i + r.from.length)) hits.push(i);
+    for (const i of hits.reverse()) {
+      const s = pos[i], e = pos[i + r.from.length - 1] + 1;
+      if (text.slice(s, e) !== r.to) text = text.slice(0, s) + r.to + text.slice(e);
+    }
+  }
+  return text;
+}
+
+// ---------- 상황(카테고리)별 어휘 ----------
+// 같은 소리도 상황에 따라 다른 말이다 (교회의 "은혜" / 병원의 "은혜"는 드물다).
+// 상황을 고르거나 지금까지 전사된 내용으로 자동으로 알아내서, 그 상황의 어휘를 힌트에 넣는다.
+const CATEGORIES = {
+  church: { label: '교회 · 예배', words: ['하나님', '예수님', '예수 그리스도', '성령', '주님', '아멘', '할렐루야', '은혜', '말씀', '성경', '찬양', '찬송가', '예배', '기도', '설교', '목사님', '전도사님', '장로님', '권사님', '집사님', '성도', '구원', '복음', '십자가', '부활', '축복', '회개', '믿음', '소망', '선교', '헌금', '주일', '중보 기도', '구역 예배', '큐티', '창세기', '요한복음', '시편', '로마서', '마태복음', '사도행전'] },
+  hospital: { label: '병원 · 진료', words: ['환자', '의사', '간호사', '진료', '진단', '처방', '처방전', '증상', '통증', '혈압', '혈당', '당뇨', '고혈압', '검사', '피검사', '엑스레이', 'CT', 'MRI', '초음파', '내시경', '수술', '입원', '퇴원', '외래', '응급실', '복용', '부작용', '알레르기', '주사', '수액', '염증', '항생제', '진통제', '소화제', '처치', '실비 보험', '재진', '수납'] },
+  meeting: { label: '회의 · 업무', words: ['회의', '안건', '일정', '예산', '분기', '매출', '실적', '보고서', '프로젝트', '마감', '담당자', '팀장님', '부장님', '대표님', '결재', '검토', '계약', '고객', '제안서', '기획', '마케팅', '개발', '출시', '피드백', 'KPI', '미팅', '이메일', '엑셀', '일정 조율', '거래처', '견적서'] },
+  class: { label: '수업 · 강의', words: ['수업', '강의', '교수님', '선생님', '학생', '과제', '숙제', '시험', '중간고사', '기말고사', '발표', '출석', '학점', '교재', '페이지', '챕터', '문제', '정답', '개념', '정의', '예제', '공식', '질문', '토론', '레포트', '제출'] },
+};
+
+// 지금까지 전사된 최근 내용에서 상황 낱말이 몇 번 나왔는지로 상황을 정한다
+let detectedCat = null;
+function detectCategory() {
+  const recent = lines.slice(-40).map((l) => l.text).join(' ');
+  const score = {};
+  for (const [k, c] of Object.entries(CATEGORIES)) {
+    score[k] = c.words.reduce((n, w) => n + (recent.split(w).length - 1), 0);
+  }
+  const [best, second] = Object.entries(score).sort((x, y) => y[1] - x[1]);
+  // 3번 이상 나오고 2위보다 확실히 많을 때만 정한다. 아니면 직전 판단을 유지한다
+  if (best[1] >= 3 && best[1] >= second[1] * 1.5) detectedCat = best[0];
+  return detectedCat;
+}
+function currentCategory() {
+  const v = $('#category').value;
+  if (v === 'auto') return detectCategory();
+  return v === 'none' ? null : v;
+}
+
+// 전사 엔진에 줄 힌트: "상황: 고친 말, 상황 어휘…" (최근에 고친 말이 먼저, 전체 160자 이내)
+function hintText() {
+  const cat = currentCategory();
+  const out = [], seen = new Set();
+  const add = (w) => { w = w.trim(); if (!w || seen.has(w)) return true; seen.add(w); out.push(w); if (out.join(', ').length > 160) { out.pop(); return false; } return true; };
+  const mine = [...learned].sort((x, y) => (y.cat === cat) - (x.cat === cat) || y.at - x.at);
+  for (const r of mine) if (!add(r.to)) break;
+  if (cat) for (const w of CATEGORIES[cat].words) if (!add(w)) break;
+  if (!out.length) return '';
+  return (cat ? CATEGORIES[cat].label.split(' · ')[0] + ': ' : '') + out.join(', ');
+}
+
+function startEdit(el, l) {
+  if (editing || !el.isConnected) return;
+  editing = l;
+  if (l.seg != null) editedSegs.add(l.seg);
+  const textEl = el.querySelector('.text');
+  const wrap = document.createElement('div');
+  wrap.style.flex = '1';
+  const ta = document.createElement('textarea');
+  ta.value = l.text;
+  ta.rows = Math.min(8, Math.max(2, Math.ceil(l.text.length / 28)));
+  ta.style.width = '100%';
+  const hint = document.createElement('div');
+  hint.className = 'edit-hint';
+  hint.textContent = 'Enter 저장 · Esc 취소 · 모두 지우고 저장하면 줄 삭제';
+  wrap.append(ta, hint);
+  textEl.replaceWith(wrap);
+  ta.focus();
+  let done = false;
+  const finish = (save) => {
+    if (done) return;
+    done = true;
+    editing = null;
+    if (save) {
+      const nt = ta.value.replace(/\s+/g, ' ').trim();
+      if (!nt) {
+        const i = lines.indexOf(l);
+        if (i >= 0) lines.splice(i, 1);
+      } else if (nt !== l.text) {
+        learnFrom(l.text, nt, l.lang);
+        l.text = nt; l.edited = true;
+      }
+      persist();
+    }
+    renderQueued = false;
+    render();
+    updateQueue();
+  };
+  ta.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); finish(true); }
+    else if (e.key === 'Escape') { e.preventDefault(); finish(false); }
+  });
+  ta.addEventListener('blur', () => finish(true));
+}
+
+transcriptEl.addEventListener('click', (e) => {
+  const el = e.target.closest('.line');
+  if (!el || !el._line || el.classList.contains('pending') || e.target.closest('textarea')) return;
+  startEdit(el, el._line);
+});
+
+// 고친 말 목록 창
+const learnDlg = $('#learnDlg'), learnList = $('#learnList');
+function updateLearnBtn() { $('#learnBtn').textContent = learned.length ? `고친 말 ${learned.length}` : '고친 말'; }
+function renderLearned() {
+  learnList.replaceChildren(...[...learned].sort((x, y) => y.at - x.at).map((r) => {
+    const li = document.createElement('li');
+    li.innerHTML = '<span class="pair"><span class="from"></span> → <b class="to"></b> <span class="n"></span></span><span class="n cat"></span><button>삭제</button>';
+    li.querySelector('.from').textContent = r.show || r.from || '(새 낱말)';
+    li.querySelector('.to').textContent = r.to;
+    li.querySelector('.n').textContent = r.n > 1 ? `${r.n}번` : '';
+    li.querySelector('.cat').textContent = r.cat ? CATEGORIES[r.cat]?.label.split(' · ')[0] || '' : '';
+    li.querySelector('button').onclick = () => { learned = learned.filter((x) => x !== r); saveLearned(); renderLearned(); };
+    return li;
+  }));
+}
+$('#learnBtn').onclick = () => { renderLearned(); learnDlg.showModal(); };
+$('#learnClose').onclick = () => learnDlg.close();
+$('#learnClear').onclick = () => {
+  if (learned.length && confirm('고친 말 기록을 모두 지울까요?')) { learned = []; saveLearned(); renderLearned(); }
+};
+// 자주 나오는 이름이나 용어를 미리 넣어 두기
+$('#learnAdd').onsubmit = (e) => {
+  e.preventDefault();
+  const w = clean($('#learnWord').value.replace(/\s+/g, ' '));
+  if (w && addRule({ kind: 'hint', from: '', show: '', to: w, lang: null, cat: currentCategory() })) { saveLearned(); renderLearned(); }
+  $('#learnWord').value = '';
+};
+updateLearnBtn();
+
+$('#category').value = store.get('category', 'auto');
+$('#category').onchange = () => { store.set('category', $('#category').value); updateQueue(); };
 
 // ---------- 녹음 후 정밀 전사 ----------
 const GROUP_MAX = 28;  // 초. Whisper는 30초 단위로 보므로 그 안에서 묶는다
@@ -307,7 +631,7 @@ async function runPrecise(session) {
     el.innerHTML = `<div class="meta">${fmt(g.t)}</div><div class="text">정밀 전사 대기…</div>`;
     groupEls.set(id, { el, t: g.t, segs: g.segs });
     preciseTotal++;
-    pworker.postMessage({ type: 'transcribe', id, audio, lang: $('#lang').value, maxTokens: 440 }, [audio.buffer]);
+    pworker.postMessage({ type: 'transcribe', id, audio, lang: $('#lang').value, maxTokens: 440, prompt: hintText() }, [audio.buffer]);
   }
   render();
   updateQueue();
@@ -320,9 +644,11 @@ function onPreciseResult(m) {
   preciseDone++;
   const ids = new Set(g.segs.map((s) => s.id));
   for (const id of ids) refiningSegs.delete(id);
-  const text = m.text ? cleanRepeats(m.text) : '';
+  const text = m.text ? applyLearned(cleanRepeats(m.text)) : '';
+  // 사용자가 그 사이에 고친 줄이 있으면 고친 내용을 지키려고 초안을 그대로 둔다
+  const userEdited = [...ids].some((id) => editedSegs.has(id));
   // 정밀 결과가 비었거나 이상하면 초안을 그대로 둔다
-  if (!m.error && text && !isJunk(text)) {
+  if (!m.error && text && !isJunk(text) && !userEdited) {
     for (const id of ids) {
       refinedSegs.add(id);
       const pending = segEls.get(id);
@@ -349,7 +675,9 @@ function updateQueue() {
   const parts = [];
   if (pendingCount > 0) parts.push(`전사 대기 ${pendingCount}개`);
   if (groupEls.size) parts.push(pready ? `정밀 전사 ${preciseDone + 1}/${preciseTotal}` : '정밀 전사 모델 준비 중');
-  statusEl.textContent = parts.length ? parts.join(' · ') : (recording ? '녹음 중 · 말하면 바로 전사돼요' : '준비 완료');
+  const cat = currentCategory();
+  const catText = cat ? ` · 상황: ${CATEGORIES[cat].label}${$('#category').value === 'auto' ? ' (자동)' : ''}` : '';
+  statusEl.textContent = (parts.length ? parts.join(' · ') : (recording ? '녹음 중 · 말하면 바로 전사돼요' : '준비 완료')) + catText;
   const has = lines.length > 0;
   $('#copy').disabled = $('#saveTxt').disabled = !has;
 }
@@ -358,12 +686,15 @@ function updateQueue() {
 function lineEl(l) {
   const el = document.createElement('div');
   const refining = l.seg != null && refiningSegs.has(l.seg);
-  el.className = 'line' + (refining ? ' refining' : l.fine || l.seg == null ? '' : ' draft');
+  el.className = 'line' + (refining ? ' refining' : l.fine || l.seg == null ? '' : ' draft') + (l.edited ? ' edited' : '');
+  el._line = l;
   el.innerHTML = `<div class="meta">${fmt(l.t)}<br><span class="badge ${l.lang}">${l.lang.toUpperCase()}</span></div><div class="text"></div>`;
   el.querySelector('.text').textContent = l.text;
   return el;
 }
 function render() {
+  // 고치는 중에는 다시 그리지 않는다 (입력 중인 내용이 사라지지 않게). 다 고치면 그린다
+  if (editing) { renderQueued = true; return; }
   const items = [
     ...lines.map((l) => ({ t: l.t, el: lineEl(l) })),
     ...segEls.values(),
@@ -385,7 +716,7 @@ function persist() { store.set('transcript', JSON.stringify(lines)); }
 function restore() {
   try {
     // 지난번에 정밀 전사를 마치지 못한 초안은 소리가 남아 있지 않으니 일반 줄로 보여 준다
-    for (const l of JSON.parse(store.get('transcript', '[]'))) lines.push({ t: l.t, lang: l.lang, text: l.text, fine: l.fine });
+    for (const l of JSON.parse(store.get('transcript', '[]'))) lines.push({ t: l.t, lang: l.lang, text: l.text, fine: l.fine, edited: l.edited });
   } catch {}
   render();
 }
