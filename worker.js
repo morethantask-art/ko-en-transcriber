@@ -9,6 +9,11 @@ import {
 } from 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.7.6';
 
 env.allowLocalModels = false;
+// 페이지가 cross-origin isolated면(서비스 워커가 헤더를 붙여 줌) CPU 전사를 여러 스레드로 돌린다.
+// 실시간·정밀 워커 두 개가 같이 돌 수 있어서 워커마다 코어의 절반, 최대 4개.
+if (self.crossOriginIsolated) {
+  env.backends.onnx.wasm.numThreads = Math.max(1, Math.min(4, Math.floor((navigator.hardwareConcurrency || 4) / 2)));
+}
 
 let model = null;
 let processor = null;
@@ -185,7 +190,7 @@ function echoesPrompt(text, prompt) {
   const norm = (s) => s.toLowerCase().replace(/[\s.,!?·]/g, '');
   let rest = norm(text);
   let hits = 0;
-  for (const term of prompt.split(',').map(norm).filter(Boolean).sort((a, b) => b.length - a.length)) {
+  for (const term of prompt.split(/[,.:\s]+/).map(norm).filter((x) => x.length >= 2).sort((a, b) => b.length - a.length)) {
     if (rest.includes(term)) { hits++; rest = rest.split(term).join(''); }
   }
   return hits >= 2 && rest.length <= 2;

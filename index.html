@@ -124,7 +124,8 @@
     <option value="wasm">CPU</option>
   </select>
   <select id="precise" aria-label="녹음 후 정밀 전사">
-    <option value="onnx-community/whisper-small" selected>정밀 전사 (small)</option>
+    <option value="auto" selected>정밀 전사 (자동)</option>
+    <option value="onnx-community/whisper-small">정밀 전사 (small)</option>
     <option value="onnx-community/whisper-base">정밀 전사 (base)</option>
     <option value="off">정밀 전사 끄기</option>
   </select>
@@ -190,6 +191,7 @@ const store = {
 //    해당 초안 줄들을 결과로 바꾼다. 짧게 잘린 구간보다 문맥이 길어 정확도가 올라간다.
 let worker, ready = false, nextId = 1, pendingCount = 0;
 let pworker = null, pready = false, pModel = null;
+let liveDevice = null; // 'webgpu' | 'wasm'
 const segEls = new Map();      // 실시간 전사 대기 중인 구간: id → {el, t}
 const groupEls = new Map();    // 정밀 전사 대기 중인 묶음: id → {el, t, segs}
 const segWaiters = new Map();  // 실시간 결과를 기다리는 정밀 전사: 구간 id → resolve
@@ -207,7 +209,7 @@ function progressHandler(label) {
     for (const f of Object.values(files)) { l += f.loaded; t += f.total; }
     barEl.style.display = 'block';
     barFill.style.width = (t ? (l / t) * 100 : 0) + '%';
-    statusEl.textContent = `${label} 모델 다운로드 중… ${(l / 1e6).toFixed(0)} / ${(t / 1e6).toFixed(0)} MB (처음 한 번만)`;
+    statusEl.textContent = `${label} 모델 불러오는 중… ${(l / 1e6).toFixed(0)} / ${(t / 1e6).toFixed(0)} MB (처음에만 내려받아요)`;
   };
 }
 
@@ -225,6 +227,7 @@ function startWorker() {
       statusEl.textContent = m.text;
     } else if (m.type === 'ready') {
       ready = true; recBtn.disabled = false; barEl.style.display = 'none';
+      liveDevice = m.device;
       statusEl.textContent = m.selftest?.ok
         ? `준비 완료 · ${m.device === 'webgpu' ? 'GPU 가속' : 'CPU'} 사용`
         : `준비됐지만 자체 점검 결과가 이상해요 (${m.device}): "${m.selftest?.text || ''}"`;
@@ -238,8 +241,15 @@ function startWorker() {
 }
 
 // 정밀 전사 워커는 처음 쓸 때 만든다 (small은 처음 한 번 수백 MB를 내려받는다)
+// 자동: 실시간 엔진이 GPU를 쓰면 small, CPU면 base. small은 CPU에서 base보다 2.5배쯤 느려서
+// 휴대폰 CPU로는 녹음 길이의 몇 배가 걸린다.
+function preciseModel() {
+  const v = $('#precise').value;
+  if (v !== 'auto') return v;
+  return liveDevice === 'webgpu' ? 'onnx-community/whisper-small' : 'onnx-community/whisper-base';
+}
 function ensurePreciseWorker() {
-  const model = $('#precise').value;
+  const model = preciseModel();
   if (model === 'off') return null;
   if (pworker && pModel === model) return pworker;
   pworker?.terminate();
@@ -297,7 +307,7 @@ function sendSegment(samples, t, session) {
   pendingCount++;
   render();
   updateQueue();
-  worker.postMessage({ type: 'transcribe', id, audio: samples, lang: $('#lang').value, prompt: hintText() }, [samples.buffer]);
+  worker.postMessage({ type: 'transcribe', id, audio: samples, lang: $('#lang').value, prompt: hintText(60, false) }, [samples.buffer]);
 }
 
 function onResult(m) {
@@ -494,16 +504,20 @@ function currentCategory() {
   return v === 'none' ? null : v;
 }
 
-// 전사 엔진에 줄 힌트: "상황: 고친 말, 상황 어휘…" (최근에 고친 말이 먼저, 전체 160자 이내)
-function hintText() {
+// 전사 엔진에 줄 힌트: "상황: 고친 말, 상황 어휘…" (최근에 고친 말이 먼저)
+// 힌트가 길수록 구간마다 읽을 것이 늘어 느려진다. 실시간은 고친 말만 짧게(60자),
+// 녹음 후 정밀 전사는 상황 어휘까지 넣는다(160자).
+function hintText(maxLen = 160, withCategory = true) {
   const cat = currentCategory();
   const out = [], seen = new Set();
-  const add = (w) => { w = w.trim(); if (!w || seen.has(w)) return true; seen.add(w); out.push(w); if (out.join(', ').length > 160) { out.pop(); return false; } return true; };
+  const add = (w) => { w = w.trim(); if (!w || seen.has(w)) return true; seen.add(w); out.push(w); if (out.join(', ').length > maxLen) { out.pop(); return false; } return true; };
   const mine = [...learned].sort((x, y) => (y.cat === cat) - (x.cat === cat) || y.at - x.at);
   for (const r of mine) if (!add(r.to)) break;
-  if (cat) for (const w of CATEGORIES[cat].words) if (!add(w)) break;
+  if (cat && withCategory) for (const w of CATEGORIES[cat].words) if (!add(w)) break;
   if (!out.length) return '';
-  return (cat ? CATEGORIES[cat].label.split(' · ')[0] + ': ' : '') + out.join(', ');
+  // 쉼표로 늘어놓은 목록을 주면 결과에도 쉼표를 마구 찍어서(base에서 확인), 짧은 문장처럼 준다
+  const head = cat && withCategory ? CATEGORIES[cat].label.replace(' · ', ' ') + ' 이야기입니다. ' : '';
+  return head + out.join(' ') + '.';
 }
 
 function startEdit(el, l) {
@@ -593,11 +607,12 @@ const GROUP_MAX = 28;  // 초. Whisper는 30초 단위로 보므로 그 안에�
 const GROUP_GAP = 6;   // 초. 이보다 오래 말이 없었으면 새 묶음 (시각 표시가 너무 어긋나지 않게)
 
 async function runPrecise(session) {
-  if (!session.length || !ensurePreciseWorker()) return;
+  if (!session.length || preciseModel() === 'off') return;
   // 실시간 결과의 언어로 묶음을 나눈다. 한 묶음 안에 한국어와 영어가 섞이면
   // 하나의 언어로 강제돼 다른 언어 문장이 번역되거나 깨질 수 있기 때문이다.
   const live = await Promise.all(session.map((s) => s.live));
-  if (!pworker) return; // 기다리는 동안 정밀 전사를 껐으면 중단
+  // 실시간 전사가 다 끝난 뒤에 정밀 모델을 준비한다 (같이 돌면 CPU를 나눠 써서 둘 다 느려진다)
+  if (!ensurePreciseWorker()) return; // 기다리는 동안 정밀 전사를 껐으면 중단
   const groups = [];
   let cur = null;
   session.forEach((s, i) => {
@@ -674,10 +689,11 @@ function updateQueue() {
   if (!ready) return;
   const parts = [];
   if (pendingCount > 0) parts.push(`전사 대기 ${pendingCount}개`);
-  if (groupEls.size) parts.push(pready ? `정밀 전사 ${preciseDone + 1}/${preciseTotal}` : '정밀 전사 모델 준비 중');
+  if (groupEls.size) parts.push(pready ? `정밀 전사 ${preciseDone + 1}/${preciseTotal} (${(pModel || '').split('-').pop()})` : '정밀 전사 모델 준비 중');
   const cat = currentCategory();
   const catText = cat ? ` · 상황: ${CATEGORIES[cat].label}${$('#category').value === 'auto' ? ' (자동)' : ''}` : '';
-  statusEl.textContent = (parts.length ? parts.join(' · ') : (recording ? '녹음 중 · 말하면 바로 전사돼요' : '준비 완료')) + catText;
+  const dev = liveDevice ? ` · ${liveDevice === 'webgpu' ? 'GPU' : 'CPU'}${liveDevice === 'wasm' && window.crossOriginIsolated ? ' 여러 스레드' : ''}` : '';
+  statusEl.textContent = (parts.length ? parts.join(' · ') : (recording ? '녹음 중 · 말하면 바로 전사돼요' : '준비 완료')) + dev + catText;
   const has = lines.length > 0;
   $('#copy').disabled = $('#saveTxt').disabled = !has;
 }
@@ -845,7 +861,7 @@ async function startRec() {
   const base = lines.length ? Math.ceil(lines[lines.length - 1].t + 5) : 0;
   // 정밀 전사가 켜져 있으면 구간 소리를 모아 두었다가 녹음을 멈출 때 다시 전사한다
   const sess = session = $('#precise').value === 'off' ? null : [];
-  if (sess) ensurePreciseWorker(); // 녹음하는 동안 미리 모델을 받아 둔다
+  // 정밀 전사 모델은 녹음을 멈춘 뒤에 준비한다. 녹음 중에 준비하면 실시간 전사와 CPU를 나눠 써서 느려진다
   segmenter = new Segmenter((s, t) => sendSegment(s, base + t, sess));
   segmenter.level = (rms) => (meterFill.style.width = Math.min(100, rms * 600) + '%');
   const resample = makeResampler(ctx.sampleRate, SR);
@@ -952,7 +968,8 @@ $('#model').onchange = $('#device').onchange = () => {
   stopPreciseWorker();
   startWorker();
 };
-$('#precise').value = store.get('precise', 'onnx-community/whisper-small');
+$('#precise').value = store.get('precise', 'auto');
+if (!$('#precise').value) $('#precise').value = 'auto';
 $('#precise').onchange = () => {
   store.set('precise', $('#precise').value);
   stopPreciseWorker(); // 다음에 녹음을 멈출 때 새 설정으로 다시 준비한다
@@ -962,7 +979,16 @@ restore();
 updateQueue();
 startWorker();
 
-if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
+// 서비스 워커가 붙여 주는 헤더로 'cross-origin isolated'가 되어야 전사 엔진이 CPU 여러 개를 쓴다.
+// 처음 설치했거나 서비스 워커가 새로 바뀐 직후에는 아직 헤더가 없으니, 한 번만 새로 고친다.
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.register('sw.js').then(() => navigator.serviceWorker.ready).then(() => {
+    if (window.crossOriginIsolated) { try { sessionStorage.removeItem('coi-reload'); } catch {} return; }
+    let tried = false;
+    try { tried = sessionStorage.getItem('coi-reload') === '1'; sessionStorage.setItem('coi-reload', '1'); } catch { tried = true; }
+    if (!tried && !recording) location.reload();
+  }).catch(() => {});
+}
 </script>
 </body>
 </html>

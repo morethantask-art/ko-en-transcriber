@@ -1,6 +1,6 @@
 // 오프라인 지원: 앱 파일과 CDN 라이브러리(전사 엔진)를 캐시한다.
 // 모델 파일은 transformers.js가 자체 캐시('transformers-cache')에 저장한다.
-const APP = 'app-v4';
+const APP = 'app-v5';
 const LIB = 'lib-v1';
 const SHELL = ['./', 'index.html', 'worker.js', 'manifest.webmanifest', 'icon-192.png', 'icon-512.png', 'selftest.wav'];
 
@@ -40,9 +40,21 @@ self.addEventListener('fetch', (e) => {
       fetch(e.request)
         .then((res) => {
           if (res.ok) caches.open(APP).then((c) => c.put(e.request, res.clone()));
-          return res;
+          return isolate(res);
         })
-        .catch(() => caches.match(e.request, { ignoreSearch: true }).then((r) => r || caches.match('index.html')))
+        .catch(() => caches.match(e.request, { ignoreSearch: true }).then((r) => r || caches.match('index.html')).then(isolate))
     );
   }
 });
+
+// 전사 엔진(onnxruntime)은 페이지가 'cross-origin isolated'일 때만 CPU 여러 개(스레드)를 쓴다.
+// GitHub Pages는 그 헤더를 보낼 수 없어서, 서비스 워커가 앱 파일 응답에 붙여 준다.
+// 한 개 → 네 개 스레드로 CPU 전사가 2~3배 빨라진다.
+// credentialless: CDN·모델 서버 파일을 쿠키 없이 받는 조건이라 따로 설정하지 않아도 된다.
+function isolate(res) {
+  if (!res || res.status === 0 || res.type === 'opaque' || res.type === 'opaqueredirect') return res;
+  const h = new Headers(res.headers);
+  h.set('Cross-Origin-Embedder-Policy', 'credentialless');
+  h.set('Cross-Origin-Opener-Policy', 'same-origin');
+  return new Response(res.body, { status: res.status, statusText: res.statusText, headers: h });
+}
