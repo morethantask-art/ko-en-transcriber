@@ -80,6 +80,26 @@
   dialog .row { display: flex; gap: 8px; justify-content: flex-end; margin-top: 12px; }
   dialog button { background: var(--card); border: 1px solid var(--line); border-radius: 9px; padding: 5px 12px; font-size: 13px; cursor: pointer; }
   #learnList button { padding: 2px 8px; }
+  /* 재생 막대와 노래방식 강조 */
+  #player { display: flex; align-items: center; gap: 8px; margin: 0 16px 8px; padding: 6px 10px; background: var(--card); border: 1px solid var(--line); border-radius: 12px; }
+  #player[hidden] { display: none; }
+  #player #play { flex: none; width: 36px; height: 36px; border-radius: 50%; border: 0; background: var(--accent); color: #fff; font-size: 14px; cursor: pointer; }
+  #player input[type=range] { flex: 1; min-width: 0; accent-color: var(--accent); }
+  #player #ptime { flex: none; font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+  #player select { flex: none; padding: 3px 4px; font-size: 12px; }
+  .line.now { background: color-mix(in srgb, var(--accent) 10%, transparent); border-radius: 8px; }
+  .line.now .text { color: var(--muted); }
+  .line.now .text span.sung { color: var(--text); font-weight: 600; }
+  .line .meta { cursor: pointer; }
+  .edit-hint button { margin-right: 6px; font-size: 12px; padding: 2px 8px; border-radius: 7px; border: 1px solid var(--line); background: var(--card); color: inherit; cursor: pointer; }
+  #recList { list-style: none; margin: 0; padding: 0; overflow-y: auto; max-height: 55vh; }
+  #recList li { display: flex; gap: 8px; align-items: center; padding: 8px 0; border-bottom: 1px solid var(--line); font-size: 14px; }
+  #recList .info { flex: 1; min-width: 0; }
+  #recList .dur { font-size: 12px; color: var(--muted); }
+  #recList .preview { font-size: 12px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #recList .acts { display: flex; flex-direction: column; gap: 4px; flex: none; }
+  #recList .acts button { padding: 2px 8px; }
+  #recList:empty::before { content: "아직 녹음이 없어요."; color: var(--muted); font-size: 13px; }
   #learnList .cat { min-width: 2.5em; text-align: right; }
   dialog .add { display: flex; gap: 6px; margin-bottom: 8px; }
   dialog .add input { flex: 1; min-width: 0; font: inherit; font-size: 14px; color: inherit; background: var(--bg); border: 1px solid var(--line); border-radius: 9px; padding: 5px 8px; }
@@ -140,6 +160,13 @@
 </header>
 <div id="status">모델 준비 중…</div>
 <div id="bar"><div></div></div>
+<div id="player" hidden>
+  <button id="play" aria-label="재생">▶</button>
+  <input id="pseek" type="range" min="0" max="1" step="0.1" value="0" aria-label="재생 위치">
+  <span id="ptime">00:00 / 00:00</span>
+  <select id="prate" aria-label="재생 속도"><option value="0.75">0.75×</option><option value="1" selected>1×</option><option value="1.25">1.25×</option><option value="1.5">1.5×</option></select>
+  <audio id="audio" preload="auto"></audio>
+</div>
 <main id="transcript"></main>
 <footer>
   <button id="rec" disabled aria-label="녹음"><span class="dot"></span><span class="sq"></span></button>
@@ -150,12 +177,20 @@
       <button id="copy" disabled>복사</button>
       <button id="saveTxt" disabled>텍스트 저장</button>
       <button id="saveAudio" disabled>녹음 파일 저장</button>
+      <button id="recBtn">녹음 목록</button>
       <label id="fileLabel">파일 전사<input id="file" type="file" accept="audio/*,video/*"></label>
       <button id="learnBtn">고친 말</button>
       <button id="clear">지우기</button>
     </div>
   </div>
 </footer>
+
+<dialog id="recDlg">
+  <h2>녹음 목록</h2>
+  <p>녹음과 전사는 이 기기의 브라우저에 자동으로 보관돼요. 열면 노래방처럼 소리에 맞춰 전사 줄이 따라가요.</p>
+  <ul id="recList"></ul>
+  <div class="row"><button id="recClose">닫기</button></div>
+</dialog>
 
 <dialog id="learnDlg">
   <h2>고친 말</h2>
@@ -189,7 +224,8 @@ const store = {
 //  - 실시간(live): 말이 끊길 때마다 짧은 구간을 빠른 모델로 바로 전사해 초안으로 보여 준다.
 //  - 정밀(precise): 녹음을 멈추면 같은 언어로 이어진 구간들을 최대 28초로 묶어 더 큰 모델로 다시 전사하고,
 //    해당 초안 줄들을 결과로 바꾼다. 짧게 잘린 구간보다 문맥이 길어 정확도가 올라간다.
-let worker, ready = false, nextId = 1, pendingCount = 0;
+// 구간 번호는 저장된 줄에도 남으니, 다시 켜도 겹치지 않게 시각으로 시작한다
+let worker, ready = false, nextId = Date.now(), pendingCount = 0;
 let pworker = null, pready = false, pModel = null;
 let liveDevice = null; // 'webgpu' | 'wasm'
 let gpuFallback = false; // GPU가 느려서 CPU로 바꿨는지
@@ -325,7 +361,7 @@ function pendingEl(t, text) {
 function sendPartial(samples, t) {
   if (!ready || partialInFlight || pendingCount > 0) return;
   partialInFlight = true;
-  if (!interim || interim.t !== t) { interim = { t, el: pendingEl(t, '듣는 중…') }; render(); }
+  if (!interim || interim.t !== t) { interim = { t, el: pendingEl(t, '듣는 중…'), sid: cur.id }; render(); }
   interim.id = 'p' + ++partialSeq;
   worker.postMessage({ type: 'transcribe', id: interim.id, audio: samples, lang: $('#lang').value, prompt: hintText(60, false) }, [samples.buffer]);
 }
@@ -343,7 +379,7 @@ function sendSegment(samples, t, session) {
   const preview = interim && interim.t === t && interim.text;
   interim = null;
   const el = pendingEl(t, preview ? preview + ' …' : '전사 중…');
-  segEls.set(id, { el, t });
+  segEls.set(id, { el, t, sid: cur.id });
   if (session) {
     session.push({ id, t, pcm: toInt16(samples), live: new Promise((res) => segWaiters.set(id, res)) });
   }
@@ -362,9 +398,8 @@ function onResult(m) {
   segWaiters.get(m.id)?.({ lang: m.lang, junk });
   segWaiters.delete(m.id);
   if (seg && !junk && !refinedSegs.has(m.id)) {
-    lines.push({ t: seg.t, lang: m.lang, text: applyLearned(cleanRepeats(m.text)), seg: m.id });
-    lines.sort((a, b) => a.t - b.t);
-    persist();
+    const line = { t: seg.t, lang: m.lang, text: applyLearned(cleanRepeats(m.text)), seg: m.id };
+    withLines(seg.sid, (ls) => ls.push(line));
   }
   render();
   updateQueue();
@@ -440,25 +475,37 @@ function wordBlocks(oldText, newText) {
   return blocks;
 }
 
-// 글자 단위로 바뀐 조각. 2글자 이상 같은 부분에서 끊고, 1글자만 같은 건 바뀐 조각에 포함한다
-function charPieces(a, b) {
+// 바뀐 곳을 낱말 단위로 찾는다. 글자 단위로 비교해 바뀐 글자가 들어 있는 낱말을 표시하고,
+// 표시된 낱말이 이어지는 구간을 하나로 묶는다. (글자 단위로만 자르면 "여기 → 요기이", "트 → 즈"처럼
+// 낱말 조각이 기록돼서 쓸모가 없었다)
+function wordRegions(fromWords, toWords) {
+  const A = fromWords.map((w) => squash(w).n), B = toWords.map((w) => squash(w).n);
+  const wa = [], wb = [];
+  A.forEach((w, k) => { for (const _ of w) wa.push(k); });
+  B.forEach((w, k) => { for (const _ of w) wb.push(k); });
+  const a = A.join(''), b = B.join('');
   const ops = lcsOps(a, b);
-  const pieces = [];
-  let cur = null, eq = [];
-  const close = () => { if (cur) pieces.push(cur); cur = null; };
-  const absorb = () => {
-    for (const [, i, j] of eq) { cur.x += a[i]; cur.y += b[j]; cur.ye = j + 1; cur.xe = i + 1; }
-    eq = [];
-  };
+  const near = (arr, i) => arr[Math.min(Math.max(i, 0), arr.length - 1)];
+  const wordsOf = ([op, i, j]) => [op === '+' ? near(wa, i - 1) : wa[i], op === '-' ? near(wb, j - 1) : wb[j]];
+  const Mo = new Set(), Mn = new Set();
   for (const op of ops) {
-    if (op[0] === '=') { if (cur) eq.push(op); continue; }
-    if (cur && eq.length) { if (eq.length >= 2) { close(); eq = []; } else absorb(); }
-    if (!cur) cur = { x: '', y: '', xs: op[1], xe: op[1], ys: op[2], ye: op[2] };
-    if (op[0] === '-') { cur.x += a[op[1]]; cur.xe = op[1] + 1; }
-    else { cur.y += b[op[2]]; cur.ye = op[2] + 1; }
+    if (op[0] === '=') continue;
+    const [wo, wn] = wordsOf(op);
+    if (wo != null) Mo.add(wo);
+    if (wn != null) Mn.add(wn);
   }
-  close();
-  return pieces;
+  const regions = [];
+  let rg = null;
+  for (const op of ops) {
+    const [wo, wn] = wordsOf(op);
+    if (Mo.has(wo) || Mn.has(wn) || op[0] !== '=') {
+      rg ??= { fo: wo ?? 0, fe: wo ?? 0, to: wn ?? 0, te: wn ?? 0 };
+      if (wo != null) { rg.fo = Math.min(rg.fo, wo); rg.fe = Math.max(rg.fe, wo); }
+      if (wn != null) { rg.to = Math.min(rg.to, wn); rg.te = Math.max(rg.te, wn); }
+    } else if (rg) { regions.push(rg); rg = null; }
+  }
+  if (rg) regions.push(rg);
+  return regions;
 }
 
 function addRule(rule) {
@@ -481,12 +528,16 @@ function learnFrom(oldText, newText, lang) {
     const oldStr = blk.from.join(' '), newStr = clean(blk.to.join(' '));
     if (!blk.from.length) { changed = addRule({ kind: 'hint', from: '', show: '', to: newStr, lang, cat }) || changed; continue; }
     const A = squash(oldStr), B = squash(newStr);
-    // 1) 글자가 바뀐 조각: "여기iso둘째" → "요기이소 툴즈"
-    for (const p of charPieces(A.n, B.n)) {
-      if (!p.y) continue;
-      const to = clean(newStr.slice(B.pos[p.ys], B.pos[p.ye - 1] + 1));
-      const show = p.x ? oldStr.slice(A.pos[p.xs], A.pos[p.xe - 1] + 1) : '';
-      changed = addRule({ kind: p.x.length >= 2 ? 'char' : 'hint', from: p.x.length >= 2 ? p.x : '', show, to, lang, cat }) || changed;
+    // 1) 글자가 바뀐 낱말들: "여기 ISO 둘째" → "요기이소 툴즈"
+    for (const rg of wordRegions(blk.from, blk.to)) {
+      const fw = blk.from.slice(rg.fo, rg.fe + 1), tw = blk.to.slice(rg.to, rg.te + 1);
+      // 끝 낱말에 같은 조사가 붙어 있으면 떼어서, 다른 조사가 붙어도 맞게 한다 ("상도님들을" → "상도님들")
+      const lf = clean(fw.at(-1)), lt = clean(tw.at(-1));
+      const j = JOSA.find((x) => lf.endsWith(x) && lt.endsWith(x) && lf.length > x.length && lt.length > x.length);
+      if (j) { fw[fw.length - 1] = lf.slice(0, -j.length); tw[tw.length - 1] = lt.slice(0, -j.length); }
+      const from = squash(fw.join(' ')).n, to = clean(tw.join(' '));
+      if (!to || from === squash(to).n || from.length > 24) continue;
+      changed = addRule({ kind: from.length >= 2 ? 'char' : 'hint', from: from.length >= 2 ? from : '', show: clean(fw.join(' ')), to, lang, cat }) || changed;
     }
     // 2) 띄어쓰기만 바뀐 낱말: "이미지 슬림" → "이미지슬림"
     const oldBare = new Set(blk.from.map((w) => stripJosa(bare(w))));
@@ -565,6 +616,8 @@ function hintText(maxLen = 160, withCategory = true) {
 
 function startEdit(el, l) {
   if (editing || !el.isConnected) return;
+  // 재생 중에 고치려고 누르면 그 자리에서 멈춘다 (▶ 버튼을 누르면 멈춘 곳부터 이어서 듣는다)
+  if (!audioEl.paused) { stopAt = null; audioEl.pause(); }
   editing = l;
   if (l.seg != null) editedSegs.add(l.seg);
   const textEl = el.querySelector('.text');
@@ -576,7 +629,16 @@ function startEdit(el, l) {
   ta.style.width = '100%';
   const hint = document.createElement('div');
   hint.className = 'edit-hint';
-  hint.textContent = 'Enter 저장 · Esc 취소 · 모두 지우고 저장하면 줄 삭제';
+  if (!playerEl.hidden) {
+    // 고치면서 그 부분 소리를 들어 본다. 누를 때 입력창이 닫히지 않게 포커스를 뺏지 않는다
+    const listen = document.createElement('button');
+    listen.type = 'button';
+    listen.textContent = '▶ 이 부분 듣기';
+    listen.addEventListener('pointerdown', (e) => e.preventDefault());
+    listen.addEventListener('click', () => playFrom(l, true));
+    hint.append(listen);
+  }
+  hint.append('Enter 저장 · Esc 취소 · 모두 지우고 저장하면 줄 삭제');
   wrap.append(ta, hint);
   textEl.replaceWith(wrap);
   ta.focus();
@@ -609,7 +671,9 @@ function startEdit(el, l) {
 
 transcriptEl.addEventListener('click', (e) => {
   const el = e.target.closest('.line');
-  if (!el || !el._line || el.classList.contains('pending') || e.target.closest('textarea')) return;
+  if (!el || !el._line || el.classList.contains('pending') || e.target.closest('textarea, button')) return;
+  // 시각을 누르면 그 줄부터 듣고, 글자를 누르면 고친다
+  if (e.target.closest('.meta') && playFrom(el._line)) return;
   startEdit(el, el._line);
 });
 
@@ -687,7 +751,7 @@ async function runPrecise(session) {
     const el = document.createElement('div');
     el.className = 'line pending';
     el.innerHTML = `<div class="meta">${fmt(g.t)}</div><div class="text">정밀 전사 대기…</div>`;
-    groupEls.set(id, { el, t: g.t, segs: g.segs });
+    groupEls.set(id, { el, t: g.t, segs: g.segs, sid: session.sid });
     preciseTotal++;
     pworker.postMessage({ type: 'transcribe', id, audio, lang: $('#lang').value, maxTokens: 440, prompt: hintText() }, [audio.buffer]);
   }
@@ -712,14 +776,50 @@ function onPreciseResult(m) {
       const pending = segEls.get(id);
       if (pending) { segEls.delete(id); }
     }
-    for (let i = lines.length - 1; i >= 0; i--) if (ids.has(lines[i].seg)) lines.splice(i, 1);
-    lines.push({ t: g.t, lang: m.lang, text, fine: true });
-    lines.sort((a, b) => a.t - b.t);
-    persist();
+    withLines(g.sid, (ls) => {
+      // 정밀 결과를 실시간 구간(말이 쉬는 곳에서 잘린 정확한 시각)에 나눠 붙인다.
+      // 한 묶음(최대 28초)을 한 줄로 두면 노래방식 재생에서 따라가기 어렵기 때문이다.
+      const liveText = g.segs.map((sg) => ls.find((l) => l.seg === sg.id)?.text || '');
+      for (let i = ls.length - 1; i >= 0; i--) if (ids.has(ls[i].seg)) ls.splice(i, 1);
+      for (const piece of splitBySegments(text, g.segs, liveText)) ls.push({ t: piece.t, lang: m.lang, text: piece.text, fine: true });
+    });
   }
   if (!groupEls.size) preciseTotal = preciseDone = 0;
   render();
   updateQueue();
+}
+
+// 정밀 결과 글을 구간마다 나눈다: 각 구간의 실시간 글자 수 비율로 자를 곳을 정하고,
+// 가까운 낱말 경계(근처에 문장 끝이 있으면 그곳)에서 자른다.
+function splitBySegments(text, segs, liveText) {
+  const w = liveText.map((x) => x.replace(/\s/g, '').length);
+  const total = w.reduce((a, b) => a + b, 0);
+  if (segs.length < 2 || !total) return [{ t: segs[0].t, text }];
+  const words = text.split(/\s+/).filter(Boolean);
+  const ends = []; // 낱말 k 뒤의 누적 글자 수 (띄어쓰기 제외)
+  let c = 0; for (const x of words) { c += x.length; ends.push(c); }
+  const chars = c;
+  const cuts = [0];
+  let acc = 0;
+  for (let k = 0; k < segs.length - 1; k++) {
+    acc += w[k];
+    const target = (acc / total) * chars;
+    let best = cuts.at(-1), bestScore = Infinity;
+    for (let b = cuts.at(-1); b <= words.length; b++) {
+      const pos = b === 0 ? 0 : ends[b - 1];
+      const sentence = b > 0 && /[.?!。]$/.test(words[b - 1]);
+      const score = Math.abs(pos - target) - (sentence ? 6 : 0);
+      if (score < bestScore) { bestScore = score; best = b; }
+    }
+    cuts.push(best);
+  }
+  cuts.push(words.length);
+  const out = [];
+  for (let k = 0; k < segs.length; k++) {
+    const piece = words.slice(cuts[k], cuts[k + 1]).join(' ');
+    if (piece) out.push({ t: segs[k].t, text: piece });
+  }
+  return out.length ? out : [{ t: segs[0].t, text }];
 }
 
 // Whisper가 무음에서 흔히 만들어내는 문구 걸러내기
@@ -754,15 +854,19 @@ function lineEl(l) {
 function render() {
   // 고치는 중에는 다시 그리지 않는다 (입력 중인 내용이 사라지지 않게). 다 고치면 그린다
   if (editing) { renderQueued = true; return; }
+  lineEls.clear();
+  const mine = (x) => x.sid === cur.id;
   const items = [
-    ...lines.map((l) => ({ t: l.t, el: lineEl(l) })),
-    ...segEls.values(),
-    ...groupEls.values(),
-    ...(interim ? [interim] : []),
+    ...lines.map((l) => { const el = lineEl(l); lineEls.set(l, el); return { t: l.t, el }; }),
+    ...[...segEls.values()].filter(mine),
+    ...[...groupEls.values()].filter(mine),
+    ...(interim && mine(interim) ? [interim] : []),
   ];
   items.sort((a, b) => a.t - b.t);
   transcriptEl.replaceChildren(...items.map((i) => i.el));
-  scrollDown();
+  // 재생 중이던 줄 강조를 새 요소에 다시 입힌다
+  if (nowLine) { const l = nowLine; nowLine = null; if (lines.includes(l)) setNowLine(l, audioEl.currentTime); }
+  if (audioEl.paused) scrollDown();
 }
 
 let stick = true;
@@ -772,15 +876,6 @@ transcriptEl.addEventListener('scroll', () => {
 const scrollDown = () => { if (stick) transcriptEl.scrollTop = transcriptEl.scrollHeight; };
 
 const asText = () => lines.map((l) => `[${fmt(l.t)}] ${l.text}`).join('\n');
-function persist() { store.set('transcript', JSON.stringify(lines)); }
-function restore() {
-  try {
-    // 지난번에 정밀 전사를 마치지 못한 초안은 소리가 남아 있지 않으니 일반 줄로 보여 준다
-    for (const l of JSON.parse(store.get('transcript', '[]'))) lines.push({ t: l.t, lang: l.lang, text: l.text, fine: l.fine, edited: l.edited });
-  } catch {}
-  render();
-}
-
 // ---------- 문장 단위로 자르기 (무음 기준) ----------
 // 100ms 프레임 단위로 소리 크기를 보고, 말이 끝난 뒤 잠깐 조용해지면 잘라서 전사로 보낸다.
 // 쉬지 않고 계속 말하면 MAX_SEG초에서 자르는데, 낱말 중간이 잘리지 않게 마지막 2초 중 가장 조용한 곳에서 자른다.
@@ -865,8 +960,266 @@ class Segmenter {
   }
 }
 
+// ---------- 녹음 보관 (세션) ----------
+// 녹음 한 번(또는 전사한 파일 하나)이 세션 하나다. 소리와 전사 줄을 함께 브라우저 저장소(IndexedDB)에 둔다.
+// 소리는 전사 엔진이 듣는 16kHz 소리를 그대로 16비트로 보관한다 (1시간 ≈ 115MB).
+// 브라우저 녹음기(webm)는 재생 위치를 옮기기 어렵고 전사 시각과 조금씩 어긋나서,
+// 전사와 똑같은 소리를 저장해야 줄과 소리가 정확히 맞는다.
+let cur = { id: 0, created: 0, kind: 'empty', name: '', duration: 0 };
+let dbp = null;
+function db() {
+  dbp ??= new Promise((res, rej) => {
+    const r = indexedDB.open('transcriber', 1);
+    r.onupgradeneeded = () => {
+      r.result.createObjectStore('sessions', { keyPath: 'id' });
+      r.result.createObjectStore('audio', { keyPath: ['sid', 'idx'] });
+    };
+    r.onsuccess = () => res(r.result);
+    r.onerror = () => rej(r.error);
+  });
+  return dbp;
+}
+async function tx(storeName, mode, fn) {
+  const d = await db();
+  return new Promise((res, rej) => {
+    const t = d.transaction(storeName, mode);
+    const out = fn(t.objectStore(storeName));
+    t.oncomplete = () => res(out?.result ?? out);
+    t.onerror = () => rej(t.error);
+  });
+}
+const getSession = (id) => tx('sessions', 'readonly', (s) => s.get(id));
+const allSessions = () => tx('sessions', 'readonly', (s) => s.getAll());
+const putSession = (v) => tx('sessions', 'readwrite', (s) => s.put(v));
+const audioRange = (sid) => IDBKeyRange.bound([sid, 0], [sid, Infinity]);
+async function deleteSession(id) {
+  await tx('sessions', 'readwrite', (s) => s.delete(id));
+  await tx('audio', 'readwrite', (s) => s.delete(audioRange(id)));
+}
+
+// 지금 보고 있는 세션 저장 (자주 불려서 0.4초 모아서 한 번에)
+let saveTimer = null;
+function persist() {
+  if (!cur.id) return;
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(() => {
+    putSession({ ...cur, lines: lines.map(({ t, lang, text, fine, edited, seg }) => ({ t, lang, text, fine, edited, seg })) }).catch(() => {});
+  }, 400);
+  store.set('currentSession', String(cur.id));
+}
+
+// 다른 세션(지난 녹음)의 줄을 바꿔야 할 때: 보고 있는 세션이면 화면에서, 아니면 저장된 것을 고친다
+async function withLines(sid, fn) {
+  if (sid === cur.id) { fn(lines); lines.sort((a, b) => a.t - b.t); persist(); render(); return; }
+  const s = await getSession(sid).catch(() => null);
+  if (!s) return;
+  fn(s.lines);
+  s.lines.sort((a, b) => a.t - b.t);
+  await putSession(s).catch(() => {});
+}
+
+function newSession(kind, name = '') {
+  const id = Date.now();
+  cur = { id, created: id, kind, name, duration: 0 };
+  lines.length = 0;
+  editedSegs.clear();
+  stopPlayback();
+  render();
+  persist();
+  return id;
+}
+
+async function openSession(id) {
+  const s = await getSession(id);
+  if (!s) return;
+  const { lines: ls, ...meta } = s;
+  cur = meta;
+  lines.length = 0;
+  for (const l of ls || []) lines.push(l);
+  store.set('currentSession', String(id));
+  stopPlayback();
+  render();
+  updateQueue();
+  await loadPlayer();
+}
+
+// 녹음하면서 소리를 5초씩 모아 저장한다 (앱이 갑자기 꺼져도 그때까지는 남는다)
+let recPcm = [], recLen = 0, recIdx = 0, recTotal = 0;
+function recordPcm(f) {
+  const i16 = toInt16(f);
+  recPcm.push(i16); recLen += i16.length; recTotal += i16.length;
+  if (recLen >= SR * 5) flushPcm();
+}
+function flushPcm() {
+  if (!recLen || !cur.id) return;
+  const out = new Int16Array(recLen);
+  let p = 0; for (const c of recPcm) { out.set(c, p); p += c.length; }
+  recPcm = []; recLen = 0;
+  const v = { sid: cur.id, idx: recIdx++, pcm: out.buffer };
+  tx('audio', 'readwrite', (s) => s.put(v)).catch(() => {});
+  cur.duration = recTotal / SR;
+  persist();
+}
+function startAudioRecord() {
+  recPcm = []; recLen = 0; recIdx = 0; recTotal = 0;
+  // 저장 공간이 부족할 때 브라우저가 녹음을 지우지 않게 요청 (크롬은 보통 묻지 않고 정한다)
+  navigator.storage?.persist?.().catch(() => {});
+}
+
+// 저장된 소리를 WAV로 묶는다
+async function sessionWav(sid) {
+  const chunks = await tx('audio', 'readonly', (s) => s.getAll(audioRange(sid)));
+  const bytes = chunks.reduce((n, c) => n + c.pcm.byteLength, 0);
+  if (!bytes) return null;
+  const h = new DataView(new ArrayBuffer(44));
+  const w = (o, s) => [...s].forEach((c, i) => h.setUint8(o + i, c.charCodeAt(0)));
+  w(0, 'RIFF'); h.setUint32(4, 36 + bytes, true); w(8, 'WAVE'); w(12, 'fmt ');
+  h.setUint32(16, 16, true); h.setUint16(20, 1, true); h.setUint16(22, 1, true);
+  h.setUint32(24, SR, true); h.setUint32(28, SR * 2, true); h.setUint16(32, 2, true); h.setUint16(34, 16, true);
+  w(36, 'data'); h.setUint32(40, bytes, true);
+  return new Blob([h.buffer, ...chunks.sort((a, b) => a.idx - b.idx).map((c) => c.pcm)], { type: 'audio/wav' });
+}
+
+// ---------- 노래방처럼 따라가며 듣기 ----------
+// 재생 중인 위치의 줄을 강조하고, 그 줄 안에서는 지난 시간만큼 낱말을 차례로 칠한다.
+// 줄마다 시작 시각만 알고 낱말별 시각은 몰라서, 줄 안의 낱말 위치는 글자 수 비율로 어림한다.
+const audioEl = $('#audio'), playerEl = $('#player'), playBtn = $('#play'), seekEl = $('#pseek'), ptimeEl = $('#ptime');
+let audioUrl = null, nowLine = null, stopAt = null, rafId = 0, userScrollAt = 0;
+const lineEls = new Map(); // 줄 → 화면 요소 (render가 채운다)
+
+async function loadPlayer() {
+  stopPlayback();
+  if (audioUrl) { URL.revokeObjectURL(audioUrl); audioUrl = null; }
+  const blob = cur.id && cur.duration > 0 && !recording ? await sessionWav(cur.id).catch(() => null) : null;
+  playerEl.hidden = !blob;
+  $('#saveAudio').disabled = !blob;
+  if (!blob) { audioEl.removeAttribute('src'); return; }
+  audioUrl = URL.createObjectURL(blob);
+  audioEl.src = audioUrl;
+  seekEl.max = cur.duration;
+  ptimeEl.textContent = `00:00 / ${fmt(cur.duration)}`;
+}
+
+function stopPlayback() {
+  if (!audioEl.paused) audioEl.pause();
+  stopAt = null;
+  setNowLine(null);
+}
+
+function lineEnd(i) {
+  return i + 1 < lines.length ? lines[i + 1].t : Math.max(lines[i].t + 1, cur.duration);
+}
+
+function setNowLine(l, t = 0) {
+  if (nowLine !== l) {
+    const old = nowLine && lineEls.get(nowLine);
+    if (old) { old.classList.remove('now'); const te = old.querySelector('.text'); if (te && nowLine) te.textContent = nowLine.text; }
+    nowLine = l;
+    const el = l && lineEls.get(l);
+    if (el) {
+      el.classList.add('now');
+      // 낱말마다 칠할 수 있게 나눈다
+      const te = el.querySelector('.text');
+      if (te) te.replaceChildren(...l.text.split(/(\s+)/).map((w) => { const s = document.createElement('span'); s.textContent = w; return s; }));
+      // 사용자가 방금 직접 스크롤했으면 화면을 끌고 가지 않는다
+      if (Date.now() - userScrollAt > 3000) el.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    }
+  }
+  const el = l && lineEls.get(l);
+  if (!el) return;
+  const i = lines.indexOf(l);
+  const frac = Math.max(0, Math.min(1, (t - l.t) / Math.max(0.5, lineEnd(i) - l.t)));
+  const spans = el.querySelectorAll('.text span');
+  const total = l.text.length || 1;
+  let acc = 0;
+  for (const s of spans) { acc += s.textContent.length; s.classList.toggle('sung', acc / total <= frac + 0.02); }
+}
+
+// 화면 갱신마다(부드럽게) 그리고 소리의 시간 이벤트마다(화면이 가려져 갱신이 멈춰도) 맞춘다
+function tick() {
+  sync();
+  cancelAnimationFrame(rafId);
+  if (!audioEl.paused) rafId = requestAnimationFrame(tick);
+}
+audioEl.addEventListener('timeupdate', sync);
+function sync() {
+  const t = audioEl.currentTime;
+  if (stopAt != null && t >= stopAt) { audioEl.pause(); stopAt = null; }
+  seekEl.value = t;
+  ptimeEl.textContent = `${fmt(t)} / ${fmt(cur.duration)}`;
+  let l = null;
+  for (const x of lines) { if (x.t <= t + 0.05) l = x; else break; }
+  if (editing) l = nowLine; // 고치는 중에는 줄 강조를 옮기지 않는다
+  setNowLine(l, t);
+}
+audioEl.addEventListener('play', () => { playBtn.textContent = '❚❚'; tick(); });
+audioEl.addEventListener('pause', () => { playBtn.textContent = '▶'; tick(); });
+audioEl.addEventListener('ended', () => { playBtn.textContent = '▶'; });
+playBtn.onclick = () => { stopAt = null; audioEl.paused ? audioEl.play() : audioEl.pause(); };
+seekEl.oninput = () => { audioEl.currentTime = +seekEl.value; tick(); };
+$('#prate').onchange = () => { audioEl.playbackRate = +$('#prate').value; };
+transcriptEl.addEventListener('wheel', () => (userScrollAt = Date.now()), { passive: true });
+transcriptEl.addEventListener('touchmove', () => (userScrollAt = Date.now()), { passive: true });
+
+// 줄의 시각을 누르면 그곳부터 듣는다
+function playFrom(l, onlyThisLine = false) {
+  if (playerEl.hidden) return false;
+  const i = lines.indexOf(l);
+  audioEl.currentTime = Math.max(0, l.t - 0.2);
+  stopAt = onlyThisLine && i >= 0 ? lineEnd(i) + 0.2 : null;
+  userScrollAt = 0;
+  audioEl.play();
+  return true;
+}
+
+const stampOf = (ms) => { const d = new Date(ms); const z = (n) => String(n).padStart(2, '0'); return `${d.getFullYear()}-${z(d.getMonth() + 1)}-${z(d.getDate())}-${z(d.getHours())}${z(d.getMinutes())}`; };
+
+// ---------- 녹음 목록 ----------
+const recDlg = $('#recDlg'), recList = $('#recList');
+const when = (ms) => new Date(ms).toLocaleString('ko-KR', { month: 'long', day: 'numeric', weekday: 'short', hour: 'numeric', minute: '2-digit' });
+async function renderRecList() {
+  const all = (await allSessions().catch(() => [])).filter((s) => s.lines?.length || s.duration > 0).sort((a, b) => b.created - a.created);
+  recList.replaceChildren(...all.map((s) => {
+    const li = document.createElement('li');
+    li.innerHTML = '<div class="info"><b class="when"></b> <span class="dur"></span><div class="preview"></div></div>' +
+      '<div class="acts"><button data-a="open">열기</button><button data-a="save">저장</button><button data-a="del">삭제</button></div>';
+    li.querySelector('.when').textContent = (s.id === cur.id ? '● ' : '') + when(s.created) + (s.name ? ` · ${s.name}` : '');
+    li.querySelector('.dur').textContent = s.duration > 0 ? `${fmt(s.duration)} · ${(s.duration * SR * 2 / 1e6).toFixed(1)}MB` : '소리 없음';
+    li.querySelector('.preview').textContent = s.lines?.map((l) => l.text).join(' ').slice(0, 80) || '(전사 없음)';
+    li.querySelector('[data-a=save]').disabled = !(s.duration > 0);
+    li.querySelector('[data-a=open]').disabled = recording;
+    li.querySelector('[data-a=open]').onclick = async () => { recDlg.close(); await openSession(s.id); };
+    li.querySelector('[data-a=save]').onclick = async () => { const b = await sessionWav(s.id); b && download(b, `녹음-${stampOf(s.created)}.wav`); };
+    li.querySelector('[data-a=del]').onclick = async () => {
+      if (!confirm(`${when(s.created)} 녹음과 전사를 지울까요? 되돌릴 수 없어요.`)) return;
+      await deleteSession(s.id);
+      if (s.id === cur.id && !recording) newSession('empty');
+      renderRecList();
+    };
+    return li;
+  }));
+}
+$('#recBtn').onclick = async () => { await renderRecList(); recDlg.showModal(); };
+$('#recClose').onclick = () => recDlg.close();
+
+// 예전 버전이 localStorage에 둔 전사 내용을 한 번만 옮겨 온다
+async function restoreSessions() {
+  try {
+    const old = JSON.parse(store.get('transcript', '[]'));
+    if (old.length) {
+      const id = Date.now() - 1;
+      await putSession({ id, created: id, kind: 'text', name: '이전 전사', duration: 0, lines: old.map(({ t, lang, text, fine, edited }) => ({ t, lang, text, fine, edited })) });
+      store.set('transcript', '[]');
+      store.set('currentSession', String(id));
+    }
+  } catch {}
+  const id = +store.get('currentSession', '0');
+  if (id && (await getSession(id).catch(() => null))) await openSession(id);
+  else newSession('empty');
+}
+
 // ---------- 녹음 ----------
-let recording = false, stream, ctx, node, mediaRecorder, recChunks = [], audioBlob = null;
+let recording = false, stream, ctx, node;
 let segmenter, timerInt, t0, wakeLock, audioFrames = 0, watchdog, session = null;
 
 // 128샘플마다 메시지를 보내면 폰에서 부담이 커서 2048샘플씩 모아 보낸다
@@ -918,30 +1271,26 @@ async function startRec() {
     return;
   }
   try { await ctx.resume(); } catch {}
-  // 1) 원본 녹음 파일 저장용
-  recChunks = []; audioBlob = null;
-  const mime = ['audio/webm;codecs=opus', 'audio/mp4', 'audio/webm'].find((t) => window.MediaRecorder?.isTypeSupported?.(t));
-  mediaRecorder = new MediaRecorder(stream, mime ? { mimeType: mime } : undefined);
-  mediaRecorder.ondataavailable = (e) => e.data.size && recChunks.push(e.data);
-  mediaRecorder.onstop = () => {
-    audioBlob = new Blob(recChunks, { type: mediaRecorder.mimeType || 'audio/webm' });
-    $('#saveAudio').disabled = false;
-  };
-  mediaRecorder.start(1000);
+  // 녹음마다 새 세션: 소리와 전사를 함께 보관한다
+  newSession('mic');
+  playerEl.hidden = true;
+  $('#saveAudio').disabled = true;
+  startAudioRecord();
 
-  // 2) 실시간 전사용 16kHz PCM
   await workletReady;
   const src = ctx.createMediaStreamSource(stream);
   node = new AudioWorkletNode(ctx, 'tap');
-  const base = lines.length ? Math.ceil(lines[lines.length - 1].t + 5) : 0;
+  const base = 0;
   // 정밀 전사가 켜져 있으면 구간 소리를 모아 두었다가 녹음을 멈출 때 다시 전사한다
   const sess = session = $('#precise').value === 'off' ? null : [];
+  if (sess) sess.sid = cur.id;
   // 정밀 전사 모델은 녹음을 멈춘 뒤에 준비한다. 녹음 중에 준비하면 실시간 전사와 CPU를 나눠 써서 느려진다
   segmenter = new Segmenter((s, t) => sendSegment(s, base + t, sess), (s, t) => sendPartial(s, base + t));
   segmenter.level = (rms) => (meterFill.style.width = Math.min(100, rms * 600) + '%');
   const resample = makeResampler(ctx.sampleRate, SR);
   audioFrames = 0;
-  node.port.onmessage = (e) => { audioFrames++; segmenter.push(resample(e.data)); };
+  // 같은 16kHz 소리를 저장하고 전사에도 쓴다 → 전사 줄의 시각과 녹음 위치가 정확히 맞는다
+  node.port.onmessage = (e) => { audioFrames++; const pcm = resample(e.data); recordPcm(pcm); segmenter.push(pcm); };
   // 일부 기기는 출력에 연결된 노드만 처리하므로, 소리 0으로 스피커에 연결해 둔다
   const mute = ctx.createGain();
   mute.gain.value = 0;
@@ -971,7 +1320,10 @@ function stopRec() {
   segmenter?.flush();
   if (session) { runPrecise(session); session = null; }
   node?.disconnect(); ctx?.close();
-  mediaRecorder?.state !== 'inactive' && mediaRecorder.stop();
+  flushPcm();
+  cur.duration = recTotal / SR;
+  persist();
+  loadPlayer();
   stream?.getTracks().forEach((t) => t.stop());
   wakeLock?.release?.(); wakeLock = null;
   recBtn.classList.remove('on');
@@ -1000,8 +1352,16 @@ $('#file').onchange = async (e) => {
     const decoded = await actx.decodeAudioData(await file.arrayBuffer());
     actx.close();
     const data = decoded.getChannelData(0);
-    const base = lines.length ? Math.ceil(lines[lines.length - 1].t + 5) : 0;
+    const base = 0;
+    newSession('file', file.name);
+    startAudioRecord();
+    for (let i = 0; i < data.length; i += SR * 5) recordPcm(data.subarray(i, i + SR * 5));
+    flushPcm();
+    cur.duration = data.length / SR;
+    persist();
+    loadPlayer();
     const sess = $('#precise').value === 'off' ? null : [];
+    if (sess) sess.sid = cur.id;
     const seg = new Segmenter((s, t) => sendSegment(s, base + t, sess));
     for (let i = 0; i < data.length; i += SR) seg.push(data.slice(i, i + SR));
     seg.flush();
@@ -1025,10 +1385,14 @@ $('#copy').onclick = async () => {
   catch { statusEl.textContent = '복사 실패'; }
 };
 $('#saveTxt').onclick = () => download(new Blob([asText()], { type: 'text/plain;charset=utf-8' }), `전사-${stamp()}.txt`);
-$('#saveAudio').onclick = () => audioBlob && download(audioBlob, `녹음-${stamp()}.${audioBlob.type.includes('mp4') ? 'm4a' : 'webm'}`);
-$('#clear').onclick = () => {
-  if (lines.length && !confirm('전사 내용을 모두 지울까요?')) return;
-  lines.length = 0; persist(); render(); updateQueue();
+$('#saveAudio').onclick = async () => { const b = await sessionWav(cur.id); b && download(b, `녹음-${stampOf(cur.created)}.wav`); };
+$('#clear').onclick = async () => {
+  if (recording) return;
+  if ((lines.length || cur.duration) && !confirm('지금 보고 있는 녹음과 전사를 지울까요? 녹음 목록에서도 지워지고 되돌릴 수 없어요.')) return;
+  await deleteSession(cur.id).catch(() => {});
+  newSession('empty');
+  await loadPlayer();
+  updateQueue();
 };
 
 $('#lang').value = store.get('lang', 'auto');
@@ -1051,7 +1415,7 @@ $('#precise').onchange = () => {
   stopPreciseWorker(); // 다음에 녹음을 멈출 때 새 설정으로 다시 준비한다
 };
 
-restore();
+restoreSessions().then(updateQueue);
 updateQueue();
 startWorker();
 
